@@ -16,15 +16,37 @@ the `claude` binary directly, the same way you would from a terminal.
 
 | Telegram input | Result |
 | --- | --- |
-| Normal text or `/ask <prompt>` | Runs `claude -p` headless, continuing the same Claude Code session via `--resume` across turns. |
-| `/newsession` | Forgets the headless session ID; the next message starts a fresh `claude -p` conversation. |
+| Normal text or `/ask <prompt>` | Runs `claude -p` headless (`--output-format stream-json`), continuing the same Claude Code session via `--resume` across turns. |
+| `/newsession` | Forgets the headless session ID for this conversation; the next message starts a fresh `claude -p` session. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/screen` | Returns recent output from that tmux session. |
 | `/status` | Reports whether the tmux session exists. |
 | `/interrupt` | Sends Ctrl-C to the tmux session. |
 
+While a headless turn runs, the bot streams progress instead of going quiet
+until it's done: every completed `Write`/`Edit`/`MultiEdit`/`NotebookEdit`
+tool call sends its own Telegram message, e.g.
+
+```
+✏️ Edited src/app.py (+4 -2)
++ def handler(request):
++ return respond(request)
+- def handler():
+- return respond()
+```
+
+Diffs come straight from the tool call's own before/after strings (no extra
+file reads), with each changed line's indentation and trailing whitespace
+stripped to stay readable on a phone. When a change touches
+`TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` (default 10) lines or more, only the
+`(+added -removed)` counts are shown, not the full diff. A 🫡 reaction on
+your message acknowledges receipt immediately, before the turn finishes.
+
 The first chat must pair using a secret pairing code. Once paired, messages
-from all other chats are silently ignored.
+from all other chats are silently ignored. In Telegram forum groups, each
+topic (`message_thread_id`) gets its own independent `claude -p` session and
+replies land back in that same topic, so parallel topics never share or
+clobber each other's Claude conversation.
 
 ## Requirements
 
@@ -83,6 +105,7 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
 | `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. |
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
+| `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
 
 ## Operational notes
 
@@ -126,5 +149,6 @@ Optional environment variables:
 - `claude-code-remote-control.md` — research notes on Anthropic's own Remote
   Control feature and why this bot doesn't use it.
 
-No license is included. Add an explicit license before distributing this
-code outside your own use.
+## License
+
+[MIT](LICENSE).
