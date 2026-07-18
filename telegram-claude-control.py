@@ -117,11 +117,14 @@ class ClaudeHeadless:
 
     Session ids are kept per conversation_id (Telegram's message_thread_id,
     or None outside of forum topics) so parallel Telegram threads don't
-    share -- or clobber -- each other's Claude context."""
+    share -- or clobber -- each other's Claude context. The mapping is
+    persisted (via on_change) so a thread's context survives a controller
+    restart; only an explicit /newsession clears it early."""
 
-    def __init__(self):
+    def __init__(self, sessions=None, on_change=None):
         self.lock = threading.Lock()
-        self.sessions = {}
+        self.sessions = sessions if sessions is not None else {}
+        self.on_change = on_change or (lambda: None)
 
     def run(self, prompt, conversation_id=None, notify=None):
         """Runs one turn, calling notify(text) for each completed
@@ -130,7 +133,7 @@ class ClaudeHeadless:
         notify = notify or (lambda text: None)
         with self.lock:
             args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
-            session_id = self.sessions.get(conversation_id)
+            session_id = self.sessions.get(str(conversation_id))
             if session_id:
                 args += ["--resume", session_id]
             if PERMISSION_MODE:
@@ -196,14 +199,19 @@ class ClaudeHeadless:
                     raise RuntimeError(f"claude timed out after {ASK_TIMEOUT}s")
                 raise RuntimeError((stderr_text or "claude exited without a result event").strip()[:1500])
             if final_result.get("session_id"):
-                self.sessions[conversation_id] = final_result["session_id"]
+                with STATE_LOCK:
+                    self.sessions[str(conversation_id)] = final_result["session_id"]
+                self.on_change()
             if final_result.get("is_error"):
                 raise RuntimeError(str(final_result.get("result") or "claude reported an error"))
             return str(final_result.get("result") or "(empty response)")
 
     def reset(self, conversation_id=None):
         with self.lock:
-            self.sessions.pop(conversation_id, None)
+            with STATE_LOCK:
+                removed = self.sessions.pop(str(conversation_id), None) is not None
+            if removed:
+                self.on_change()
 
 
 CLAUDE = ClaudeHeadless()
@@ -265,6 +273,13 @@ def api(method, payload=None):
     return client.call(method, payload)
 
 
+# Guards both the on-disk state file and the in-memory `sessions` dict it
+# mirrors, so a background `claude -p` turn finishing (mutating sessions) can
+# never race the main loop's per-update write_state() into a corrupt file or
+# a "dictionary changed size during iteration" error.
+STATE_LOCK = threading.Lock()
+
+
 def read_state():
     try:
         with open(STATE_PATH, encoding="utf-8") as file:
@@ -274,12 +289,13 @@ def read_state():
 
 
 def write_state(state):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    temporary = STATE_PATH + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as file:
-        json.dump(state, file)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, STATE_PATH)
+    with STATE_LOCK:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        temporary = STATE_PATH + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(state, file)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, STATE_PATH)
 
 
 def tmux(*args, input_text=None):
@@ -423,6 +439,10 @@ def handle(message, state):
 
 def main():
     state = read_state()
+    # Reuse the same dict object (not a copy) so mutations CLAUDE makes to it
+    # are already reflected in the next write_state(state) call below.
+    CLAUDE.sessions = state.setdefault("sessions", {})
+    CLAUDE.on_change = lambda: write_state(state)
     try:
         # Establish the sender's TLS connection before the first user message,
         # making the immediate acknowledgement a reused connection.
