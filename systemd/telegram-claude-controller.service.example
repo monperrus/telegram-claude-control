@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram controller for Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/remote-tmux/claude-remote-control/telegram-claude-control.py
+Environment=TELEGRAM_CLAUDE_CONFIG=/home/remote-tmux/.config/telegram-claude-control.env
+Environment=TELEGRAM_CLAUDE_STATE=/home/remote-tmux/.local/state/telegram-claude-control.json
+Environment=TELEGRAM_CLAUDE_SESSION=claude
+Environment=TELEGRAM_CLAUDE_WORKSPACE=/home/remote-tmux
+Environment=TELEGRAM_CLAUDE_BIN=/home/remote-tmux/.local/bin/claude
+Restart=on-failure
+RestartSec=5
+User=remote-tmux
+
+[Install]
+WantedBy=default.target
