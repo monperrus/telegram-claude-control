@@ -10,6 +10,7 @@ import difflib
 import http.client
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,6 +35,8 @@ BG_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_BG_TIMEOUT", "14400"))
 # Inline the diff in the edited-file notification when total changed lines
 # (added + removed) is below this. Above it, only the +/- counts are shown.
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
+# systemd --user unit installed by install.sh; /restart targets this.
+UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.service")
 
 
 def config():
@@ -449,6 +452,26 @@ def screen(lines=120):
     return output[-3800:]
 
 
+def restart_controller():
+    """Asks systemd to restart this service's unit and returns an error
+    string, or None on success. --no-block makes systemctl return as soon as
+    the job is queued instead of waiting for the stop+start cycle to finish
+    -- which would otherwise mean waiting on systemd to SIGTERM this very
+    process before the call could ever return."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "--no-block", "restart", UNIT_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as error:
+        return str(error)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip() or f"systemctl exited {result.returncode}"
+    return None
+
+
 def delayed_screen(chat_id, thread_id):
     """Give an interactive Claude Code session time to respond, without
     pausing Telegram polling."""
@@ -643,8 +666,9 @@ def handle(message, state):
             "/bg <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
             "/jobs: list running background jobs. /cancel <job_id>: kill one. "
+            "/restart: restart the controller's systemd service. "
             "/screen, /status, /interrupt. "
-            "One-letter shortcuts: h=help s=status v=screen i=interrupt t=jobs (`t <prompt>`=/bg) "
+            "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
             "m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
             thread_id,
         )
@@ -691,6 +715,14 @@ def handle(message, state):
         reply(chat_id, "Usage: /cancel <job_id>", thread_id)
     elif command.startswith("/cancel "):
         reply(chat_id, cancel_job(command[8:].strip()), thread_id)
+    elif command == "/restart":
+        # Reply (a blocking network call) completes before systemd's SIGTERM
+        # can land, so the acknowledgment always reaches Telegram -- even
+        # though this same process is what's about to be killed.
+        reply(chat_id, "Restarting controller…", thread_id)
+        error = restart_controller()
+        if error:
+            reply(chat_id, f"Restart failed: {error}", thread_id)
     elif command == "/newsession":
         CLAUDE.reset(thread_id)
         reply(chat_id, "Headless conversation cleared. Next message starts a new claude -p session.", thread_id)
@@ -734,5 +766,39 @@ def main():
             time.sleep(5)
 
 
+def check():
+    """Validates the install without entering the polling loop. Returns True
+    if every fatal check passed (tmux session availability is a warning
+    only, matching install docs -- an idle bot may just not have one yet)."""
+    ok = True
+
+    def report(passed, message, fatal=True):
+        nonlocal ok
+        print(("ok   " if passed else ("FAIL " if fatal else "warn ")) + message)
+        if fatal:
+            ok = ok and passed
+
+    try:
+        mode = oct(os.stat(CONFIG_PATH).st_mode & 0o777)
+        report(mode == "0o600", f"config file is mode {mode} (want 0o600): {CONFIG_PATH}")
+    except OSError as error:
+        report(False, f"config file: {error}")
+
+    report(shutil.which("tmux") is not None, "tmux is on PATH")
+    report(os.access(CLAUDE_BIN, os.X_OK) or shutil.which(CLAUDE_BIN) is not None, f"claude binary is executable: {CLAUDE_BIN}")
+    report(os.path.isdir(WORKSPACE), f"workspace directory exists: {WORKSPACE}")
+    report(tmux("has-session", "-t", SESSION).returncode == 0, f"tmux session '{SESSION}' is available", fatal=False)
+
+    try:
+        api("getMe")
+        report(True, "Telegram bot API connectivity (getMe)")
+    except Exception as error:
+        report(False, f"Telegram bot API connectivity: {error}")
+
+    return ok
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv[1:]:
+        sys.exit(0 if check() else 1)
     main()

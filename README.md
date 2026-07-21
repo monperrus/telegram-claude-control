@@ -23,6 +23,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
 | `/jobs` | Lists running background jobs (id, elapsed time, prompt). |
 | `/cancel <job_id>` | Kills a running background job. |
+| `/restart` | Restarts the controller's systemd `--user` service (see Install). |
 | `/screen` | Returns recent output from that tmux session. |
 | `/status` | Reports whether the tmux session exists. |
 | `/interrupt` | Sends Ctrl-C to the tmux session. |
@@ -80,8 +81,60 @@ long `/bg` job in one topic never blocks `/ask` in another.
   `/interrupt` commands).
 - `claude` (Claude Code CLI) installed and authenticated on this host.
 - A Telegram bot token from [BotFather](https://t.me/BotFather).
+- `systemd --user` (only needed for `install.sh` and `/restart`; everything
+  else works fine run by hand or under another supervisor).
 
 ## Install
+
+Quickest path — installs a `systemd --user` service running straight out of
+this checkout (no copy elsewhere):
+
+```sh
+./install.sh
+# or non-interactively:
+BOT_TOKEN='your-token' ./install.sh
+```
+
+`install.sh` prompts for (or accepts via `--bot-token`/`BOT_TOKEN`) the bot
+token, generates a `PAIR_CODE` if you don't pass one, writes
+`~/.config/telegram-claude-control.env` at mode 600, and installs+enables
+`systemd/telegram-claude-controller.user.service` under
+`~/.config/systemd/user/`. Options: `--force` (regenerate the config),
+`--no-start` (install/enable without starting). This is also what `/restart`
+targets, so pairing and restarting from Telegram only work once the service
+is installed this way (or an equivalent unit named `telegram-claude-controller.service`
+exists — override the name via `TELEGRAM_CLAUDE_UNIT`).
+
+Validate an install without entering the polling loop:
+
+```sh
+./telegram-claude-control.py --check
+```
+
+Checks config file permissions, `tmux` on `PATH`, the `claude` binary,
+the workspace directory, tmux session availability (warning only), and
+Telegram API connectivity.
+
+For the bot to keep running after you log out of this machine:
+
+```sh
+loginctl enable-linger "$USER"
+```
+
+If you want the `/tmux` bridge, start an interactive Claude Code session in
+a named tmux session (default name `claude`) before pairing:
+
+```sh
+tmux new-session -d -s claude "claude"
+```
+
+Then in Telegram, send `/pair <your pairing code>` from the one chat that
+should control the bot. Use `/help` to confirm it's working.
+
+### Manual install
+
+Prefer to run it by hand (e.g. under your own process supervisor) instead of
+`install.sh`:
 
 1. Create a config file with restricted permissions:
 
@@ -92,23 +145,13 @@ long `/bg` job in one topic never blocks `/ask` in another.
    ```
 
 2. Set `BOT_TOKEN` and a long, random `PAIR_CODE` in that file.
-3. If you want the `/tmux` bridge, start an interactive Claude Code session
-   in a named tmux session (default name `claude`):
-
-   ```sh
-   tmux new-session -d -s claude "claude"
-   ```
-
-4. Run the controller manually first:
+3. Run the controller manually:
 
    ```sh
    ./telegram-claude-control.py
    ```
 
-5. In Telegram, send `/pair <your pairing code>` from the one chat that
-   should control the bot. Use `/help` to confirm it's working.
-
-For a persistent service, see
+For a system-wide (not `--user`) service, adapt
 [systemd/telegram-claude-controller.service.example](systemd/telegram-claude-controller.service.example).
 
 ## Configuration
@@ -132,6 +175,7 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
 | `TELEGRAM_CLAUDE_SH_TIMEOUT` | `60` | Seconds to wait for a `/sh` command before giving up. |
 | `TELEGRAM_CLAUDE_BG_TIMEOUT` | `14400` | Seconds to wait for a `/bg` background job before giving up (4 hours). |
+| `TELEGRAM_CLAUDE_UNIT` | `telegram-claude-controller.service` | systemd `--user` unit name that `/restart` restarts. |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
 
 ## Operational notes
@@ -167,12 +211,17 @@ Optional environment variables:
   command manually as the service user to see the raw error — usually a
   missing/expired login, an unreachable `TELEGRAM_CLAUDE_BIN` path, or a
   permission-mode mismatch (see the note above).
+- **`/restart` replies "Restart failed: Unit ... not found":** the
+  controller isn't running under the systemd unit `/restart` expects — run
+  `./install.sh` (or set `TELEGRAM_CLAUDE_UNIT` to the actual unit name).
 
 ## Files
 
-- `telegram-claude-control.py` — controller program.
+- `telegram-claude-control.py` — controller program (also: `--check`).
+- `install.sh` — installs config + the systemd `--user` service.
 - `telegram-claude-control.env.example` — safe secret-config template.
-- `systemd/` — optional service template.
+- `systemd/` — service templates (`.user.service` installed by `install.sh`;
+  `.service.example` is a system-wide template to adapt by hand).
 - `claude-code-remote-control.md` — research notes on Anthropic's own Remote
   Control feature and why this bot doesn't use it.
 

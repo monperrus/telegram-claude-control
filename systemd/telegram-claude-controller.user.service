@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram controller for Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/claude-remote-control/telegram-claude-control.py
+Environment=TELEGRAM_CLAUDE_CONFIG=%h/.config/telegram-claude-control.env
+Environment=TELEGRAM_CLAUDE_STATE=%h/.local/state/telegram-claude-control.json
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
