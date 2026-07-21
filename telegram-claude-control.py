@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 CONFIG_PATH = os.environ.get("TELEGRAM_CLAUDE_CONFIG", os.path.expanduser("~/.config/telegram-claude-control.env"))
 STATE_PATH = os.environ.get("TELEGRAM_CLAUDE_STATE", os.path.expanduser("~/.local/state/telegram-claude-control.json"))
@@ -172,7 +173,6 @@ class ClaudeHeadless:
         self._locks_guard = threading.Lock()
         self._conversation_locks = {}
         self._jobs_lock = threading.Lock()
-        self._job_seq = 0
         self.jobs = {}
 
     def set_model(self, conversation_id, model):
@@ -310,11 +310,25 @@ class ClaudeHeadless:
         lock = self._conversation_lock(conversation_id)
         if not lock.acquire(blocking=False):
             return None
+        # uuid4, not a sequence counter: self._job_seq resets to 0 on every
+        # restart, but JOBS (SQLite) is durable across restarts, so a
+        # sequential id would collide with a still-present historical row
+        # (UNIQUE constraint failure) as soon as a job ran before the restart.
+        job_id = f"bg{uuid.uuid4().hex[:8]}"
         with self._jobs_lock:
-            self._job_seq += 1
-            job_id = f"bg{self._job_seq}"
             self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None, "cancelled": False}
-        on_start(job_id)
+        try:
+            on_start(job_id)
+        except Exception:
+            # on_start (JOBS.start) can still fail for other reasons (e.g. a
+            # locked db file). Without this, the lock/registry entry above
+            # would leak permanently -- silently blocking every future /ask
+            # and /bg on this conversation with "already running" even
+            # though no job is actually running.
+            with self._jobs_lock:
+                self.jobs.pop(job_id, None)
+            lock.release()
+            raise
 
         def on_process(process):
             with self._jobs_lock:
