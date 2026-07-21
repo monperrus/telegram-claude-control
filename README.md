@@ -20,6 +20,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/newsession` | Forgets the headless session ID for this conversation; the next message starts a fresh `claude -p` session. |
 | `/model` | Shows the model for this conversation and offers `sonnet`/`opus`/`haiku` as buttons. |
 | `/model <name>` | Sets `--model <name>` for this conversation's `claude -p` calls (`/model default` clears it). |
+| `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
 | `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
@@ -57,7 +58,7 @@ translated into a short, plain-English message instead of a raw error dump.
 
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
 `v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/bg`
-(`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`)
+(`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`) `u`=`/usage`
 `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=`/ask <prompt>`.
 Only an exact `<letter>` or `<letter> <rest>` triggers a shortcut —
 anything else (including sentences that happen to start with one of these
@@ -66,6 +67,13 @@ unchanged. The one exception is `x`/`m`/`t`/`c`/`a`: a message that
 genuinely starts with one of those letters followed by a space (e.g. "x-ray"
 typed as "x ray gun") will be misread as a shortcut — say it another way, or
 use the full `/sh`/`/tmux`/`/bg`/`/ask`/`/model` command instead.
+
+`/usage` runs Claude Code's own built-in `/usage` command (aliased
+`/cost`/`/stats`) directly via `claude -p "/usage" --output-format json` —
+not through the tmux bridge, and not tied to any conversation's `--resume`
+session. It's a free, local, near-instant query (no API tokens spent)
+reporting current session and weekly usage against your plan's limits, plus
+what's contributing to it.
 
 The per-conversation model choice (`/model`) is persisted the same way the
 `--resume` session id is — it survives a controller restart and is
@@ -207,6 +215,7 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
 | `TELEGRAM_CLAUDE_SH_TIMEOUT` | `60` | Seconds to wait for a `/sh` command before giving up. |
 | `TELEGRAM_CLAUDE_BG_TIMEOUT` | `14400` | Seconds to wait for a `/bg` background job before giving up (4 hours). |
+| `TELEGRAM_CLAUDE_USAGE_TIMEOUT` | `30` | Seconds to wait for `/usage` before giving up. |
 | `TELEGRAM_CLAUDE_UNIT` | `telegram-claude-controller.service` | systemd `--user` unit name that `/restart` restarts. |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
 

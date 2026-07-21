@@ -37,6 +37,10 @@ BG_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_BG_TIMEOUT", "14400"))
 # Inline the diff in the edited-file notification when total changed lines
 # (added + removed) is below this. Above it, only the +/- counts are shown.
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
+# /usage runs claude -p "/usage" directly: a free, instant, local-only
+# meta-command (no API tokens, no --resume needed), so it gets its own short
+# timeout instead of reusing ASK_TIMEOUT.
+USAGE_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_USAGE_TIMEOUT", "30"))
 # systemd --user unit installed by install.sh; /restart targets this.
 UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.service")
 # /model button shortcuts; /model <any other id> is also accepted verbatim.
@@ -744,6 +748,31 @@ def cancel_job(job_id):
     return f"Cancelled {job_id}." if CLAUDE.cancel_job(job_id) else f"No running background job {job_id}."
 
 
+def usage_report():
+    """Runs claude -p "/usage" -- a built-in Claude Code command
+    (supportsNonInteractive) that reports current session/weekly usage
+    against the account's plan limits. It's a local, no-token query (no
+    --resume, no conversation state), so it's called directly rather than
+    through ClaudeHeadless."""
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "-p", "/usage", "--output-format", "json"],
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=USAGE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"/usage timed out after {USAGE_TIMEOUT}s"
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return (result.stderr or result.stdout).strip()[:1500] or f"/usage exited {result.returncode} with no output"
+    if payload.get("is_error"):
+        return str(payload.get("result") or "/usage reported an error")
+    return str(payload.get("result") or "(empty /usage response)")
+
+
 def run_shell(command):
     """Runs `command` directly (not through tmux) and returns its combined
     stdout/stderr, unlike /tmux which types into the long-lived interactive
@@ -832,6 +861,7 @@ ONE_LETTER_SHORTCUTS = {
     "r": "/restart",
     "t": "/jobs",
     "a": "/model",
+    "u": "/usage",
 }
 # One letter plus " <argument>".
 PREFIXED_SHORTCUTS = {
@@ -894,11 +924,15 @@ def handle(message, state):
             "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
             "/model: show/pick the Claude model for this conversation (sonnet/opus/haiku or any model id); "
             "/model default resets it. "
+            "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
             "/status, /interrupt. "
             "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
-            "a=model (`a <name>` selects) m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
+            "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
             thread_id,
+            buttons=[("usage", "/usage")],
         )
+    elif command == "/usage":
+        reply(chat_id, usage_report(), thread_id)
     elif command == "/screen":
         text, buttons = screen_entry()
         reply(chat_id, text, thread_id, buttons=buttons)
