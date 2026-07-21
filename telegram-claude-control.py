@@ -1032,8 +1032,14 @@ def handle(message, state):
     elif command == "/restart":
         # Reply (a blocking network call) completes before systemd's SIGTERM
         # can land, so the acknowledgment always reaches Telegram -- even
-        # though this same process is what's about to be killed.
+        # though this same process is what's about to be killed. Flush the
+        # already-advanced offset first too, otherwise a SIGTERM landing
+        # before main()'s post-dispatch write_state() would leave this same
+        # /restart update unconsumed on disk -- replayed on every boot into
+        # an infinite self-restart loop (this is what tripped systemd's
+        # start-limit before this fix).
         reply(chat_id, "Restarting controller…", thread_id)
+        write_state(state)
         error = restart_controller()
         if error:
             reply(chat_id, f"Restart failed: {error}", thread_id)
