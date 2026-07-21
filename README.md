@@ -19,6 +19,10 @@ the `claude` binary directly, the same way you would from a terminal.
 | Normal text or `/ask <prompt>` | Runs `claude -p` headless (`--output-format stream-json`), continuing the same Claude Code session via `--resume` across turns. |
 | `/newsession` | Forgets the headless session ID for this conversation; the next message starts a fresh `claude -p` session. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
+| `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
+| `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
+| `/jobs` | Lists running background jobs (id, elapsed time, prompt). |
+| `/cancel <job_id>` | Kills a running background job. |
 | `/screen` | Returns recent output from that tmux session. |
 | `/status` | Reports whether the tmux session exists. |
 | `/interrupt` | Sends Ctrl-C to the tmux session. |
@@ -47,6 +51,12 @@ from all other chats are silently ignored. In Telegram forum groups, each
 topic (`message_thread_id`) gets its own independent `claude -p` session and
 replies land back in that same topic, so parallel topics never share or
 clobber each other's Claude conversation.
+
+Only one request (foreground `/ask` or background `/bg`) runs per topic at a
+time, since two processes can't safely share the same `--resume` session —
+a second request on the same topic is rejected with a "already running"
+reply rather than queued. Different topics run fully in parallel, so a
+long `/bg` job in one topic never blocks `/ask` in another.
 
 ## Requirements
 
@@ -105,6 +115,8 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
 | `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. |
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
+| `TELEGRAM_CLAUDE_SH_TIMEOUT` | `60` | Seconds to wait for a `/sh` command before giving up. |
+| `TELEGRAM_CLAUDE_BG_TIMEOUT` | `14400` | Seconds to wait for a `/bg` background job before giving up (4 hours). |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
 
 ## Operational notes

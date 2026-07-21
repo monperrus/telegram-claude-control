@@ -27,6 +27,10 @@ CLAUDE_BIN = os.environ.get("TELEGRAM_CLAUDE_BIN", os.path.expanduser("~/.local/
 # that global setting.
 PERMISSION_MODE = os.environ.get("TELEGRAM_CLAUDE_PERMISSION_MODE", "")
 ASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_ASK_TIMEOUT", "600"))
+SH_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_SH_TIMEOUT", "60"))
+# /bg jobs run detached from the ASK_TIMEOUT-bound foreground path (see
+# ClaudeHeadless.start_background), so they get their own, much longer cap.
+BG_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_BG_TIMEOUT", "14400"))
 # Inline the diff in the edited-file notification when total changed lines
 # (added + removed) is below this. Above it, only the +/- counts are shown.
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
@@ -119,99 +123,177 @@ class ClaudeHeadless:
     or None outside of forum topics) so parallel Telegram threads don't
     share -- or clobber -- each other's Claude context. The mapping is
     persisted (via on_change) so a thread's context survives a controller
-    restart; only an explicit /newsession clears it early."""
+    restart; only an explicit /newsession clears it early.
+
+    Locking is per conversation_id, not global: a claude -p session cannot
+    safely be driven by two concurrent processes sharing the same --resume
+    id, but unrelated Telegram topics must still be able to run at the same
+    time -- otherwise one /bg job would freeze every other topic for as long
+    as it runs."""
 
     def __init__(self, sessions=None, on_change=None):
-        self.lock = threading.Lock()
         self.sessions = sessions if sessions is not None else {}
         self.on_change = on_change or (lambda: None)
+        self._locks_guard = threading.Lock()
+        self._conversation_locks = {}
+        self._jobs_lock = threading.Lock()
+        self._job_seq = 0
+        self.jobs = {}
+
+    def _conversation_lock(self, conversation_id):
+        key = str(conversation_id)
+        with self._locks_guard:
+            return self._conversation_locks.setdefault(key, threading.Lock())
+
+    def _execute(self, prompt, conversation_id, notify, timeout, on_process=None):
+        """One `claude -p` turn: spawns the process, parses its JSONL event
+        stream (calling notify(text) per completed file-editing tool call),
+        and returns the final assistant result text. Shared by the
+        foreground /ask path and background /bg jobs -- they differ only in
+        their timeout and in how the caller is allowed to observe/cancel the
+        process (on_process)."""
+        args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        session_id = self.sessions.get(str(conversation_id))
+        if session_id:
+            args += ["--resume", session_id]
+        if PERMISSION_MODE:
+            args += ["--permission-mode", PERMISSION_MODE]
+        process = subprocess.Popen(
+            args,
+            cwd=WORKSPACE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        if on_process:
+            on_process(process)
+        timed_out = threading.Event()
+
+        def on_timeout():
+            timed_out.set()
+            process.kill()
+
+        timer = threading.Timer(timeout, on_timeout)
+        timer.start()
+        pending_tools = {}
+        final_result = None
+        try:
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                event_type = event.get("type")
+                if event_type == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_use":
+                            pending_tools[block["id"]] = (block.get("name"), block.get("input", {}))
+                elif event_type == "user":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") != "tool_result":
+                            continue
+                        name, tool_input = pending_tools.pop(block.get("tool_use_id"), (None, {}))
+                        if name not in FILE_EDIT_TOOLS:
+                            continue
+                        path = _tool_target_path(name, tool_input)
+                        if block.get("is_error"):
+                            error_text = str(block.get("content", ""))[:300]
+                            notify(f"❌ {name} failed on {path}: {error_text}")
+                            continue
+                        added, removed, preview = _edit_stats(name, tool_input)
+                        header = f"✏️ {FILE_EDIT_TOOLS[name]} {path} (+{added} -{removed})"
+                        if preview and added + removed < DIFF_PREVIEW_MAX_LINES:
+                            notify(header + "\n" + "\n".join(preview))
+                        else:
+                            notify(header)
+                elif event_type == "result":
+                    final_result = event
+            process.wait(timeout=10)
+        finally:
+            timer.cancel()
+        stderr_text = process.stderr.read()
+        if final_result is None:
+            if timed_out.is_set():
+                raise RuntimeError(f"claude timed out after {timeout}s")
+            raise RuntimeError((stderr_text or "claude exited without a result event").strip()[:1500])
+        if final_result.get("session_id"):
+            with STATE_LOCK:
+                self.sessions[str(conversation_id)] = final_result["session_id"]
+            self.on_change()
+        if final_result.get("is_error"):
+            raise RuntimeError(str(final_result.get("result") or "claude reported an error"))
+        return str(final_result.get("result") or "(empty response)")
 
     def run(self, prompt, conversation_id=None, notify=None):
-        """Runs one turn, calling notify(text) for each completed
+        """Runs one foreground turn, calling notify(text) for each completed
         file-editing tool call as it happens, and returning the final
-        assistant result text once the turn completes."""
+        assistant result text once the turn completes. Raises immediately
+        (no blocking) if a /bg job already owns this conversation."""
         notify = notify or (lambda text: None)
-        with self.lock:
-            args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
-            session_id = self.sessions.get(str(conversation_id))
-            if session_id:
-                args += ["--resume", session_id]
-            if PERMISSION_MODE:
-                args += ["--permission-mode", PERMISSION_MODE]
-            process = subprocess.Popen(
-                args,
-                cwd=WORKSPACE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            timed_out = threading.Event()
+        lock = self._conversation_lock(conversation_id)
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("A request is already running for this conversation. Check /jobs, or wait for it to finish.")
+        try:
+            return self._execute(prompt, conversation_id, notify, ASK_TIMEOUT)
+        finally:
+            lock.release()
 
-            def on_timeout():
-                timed_out.set()
-                process.kill()
+    def start_background(self, prompt, conversation_id, thread_id, notify):
+        """Starts prompt as a background job that is not bound by
+        ASK_TIMEOUT: it runs on a daemon thread owned by the long-lived
+        controller process itself, so it survives well past any single
+        `claude -p` process's lifetime. notify(text) is used both for
+        progress messages and for the final completion/failure message,
+        exactly like the foreground path. Returns the new job_id, or None if
+        this conversation is already busy (foreground or another /bg job)."""
+        lock = self._conversation_lock(conversation_id)
+        if not lock.acquire(blocking=False):
+            return None
+        with self._jobs_lock:
+            self._job_seq += 1
+            job_id = f"bg{self._job_seq}"
+            self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None}
 
-            timer = threading.Timer(ASK_TIMEOUT, on_timeout)
-            timer.start()
-            pending_tools = {}
-            final_result = None
+        def on_process(process):
+            with self._jobs_lock:
+                if job_id in self.jobs:
+                    self.jobs[job_id]["process"] = process
+
+        def worker():
             try:
-                for line in process.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    event_type = event.get("type")
-                    if event_type == "assistant":
-                        for block in event.get("message", {}).get("content", []):
-                            if block.get("type") == "tool_use":
-                                pending_tools[block["id"]] = (block.get("name"), block.get("input", {}))
-                    elif event_type == "user":
-                        for block in event.get("message", {}).get("content", []):
-                            if block.get("type") != "tool_result":
-                                continue
-                            name, tool_input = pending_tools.pop(block.get("tool_use_id"), (None, {}))
-                            if name not in FILE_EDIT_TOOLS:
-                                continue
-                            path = _tool_target_path(name, tool_input)
-                            if block.get("is_error"):
-                                error_text = str(block.get("content", ""))[:300]
-                                notify(f"❌ {name} failed on {path}: {error_text}")
-                                continue
-                            added, removed, preview = _edit_stats(name, tool_input)
-                            header = f"✏️ {FILE_EDIT_TOOLS[name]} {path} (+{added} -{removed})"
-                            if preview and added + removed < DIFF_PREVIEW_MAX_LINES:
-                                notify(header + "\n" + "\n".join(preview))
-                            else:
-                                notify(header)
-                    elif event_type == "result":
-                        final_result = event
-                process.wait(timeout=10)
+                result = self._execute(prompt, conversation_id, notify, BG_TIMEOUT, on_process=on_process)
+                notify(f"✅ Background job {job_id} finished:\n{result}")
+            except Exception as error:
+                notify(f"❌ Background job {job_id} failed: {error}")
             finally:
-                timer.cancel()
-            stderr_text = process.stderr.read()
-            if final_result is None:
-                if timed_out.is_set():
-                    raise RuntimeError(f"claude timed out after {ASK_TIMEOUT}s")
-                raise RuntimeError((stderr_text or "claude exited without a result event").strip()[:1500])
-            if final_result.get("session_id"):
-                with STATE_LOCK:
-                    self.sessions[str(conversation_id)] = final_result["session_id"]
-                self.on_change()
-            if final_result.get("is_error"):
-                raise RuntimeError(str(final_result.get("result") or "claude reported an error"))
-            return str(final_result.get("result") or "(empty response)")
+                with self._jobs_lock:
+                    self.jobs.pop(job_id, None)
+                lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return job_id
+
+    def list_jobs(self):
+        with self._jobs_lock:
+            return [(job_id, dict(job)) for job_id, job in self.jobs.items()]
+
+    def cancel_job(self, job_id):
+        with self._jobs_lock:
+            job = self.jobs.get(job_id)
+        if job is None or job["process"] is None:
+            return False
+        job["process"].kill()
+        return True
 
     def reset(self, conversation_id=None):
-        with self.lock:
-            with STATE_LOCK:
-                removed = self.sessions.pop(str(conversation_id), None) is not None
-            if removed:
-                self.on_change()
+        with STATE_LOCK:
+            removed = self.sessions.pop(str(conversation_id), None) is not None
+        if removed:
+            self.on_change()
 
 
 CLAUDE = ClaudeHeadless()
@@ -332,6 +414,63 @@ def run_ask(chat_id, thread_id, prompt):
         reply(chat_id, f"claude -p request failed: {error}", thread_id)
 
 
+def start_bg(chat_id, message_id, thread_id, prompt):
+    """Start a /bg job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
+    job can run for hours. notify (here, reply) delivers both progress and
+    the final completion/failure message whenever the job actually ends."""
+    job_id = CLAUDE.start_background(prompt, conversation_id=thread_id, thread_id=thread_id, notify=lambda text: reply(chat_id, text, thread_id))
+    if job_id is None:
+        reply(chat_id, "A request is already running for this conversation. Check /jobs, or wait for it to finish.", thread_id)
+        return
+    try:
+        acknowledge(chat_id, message_id)
+    except Exception as error:
+        print(f"telegram-claude-control: reaction failed: {error}", file=sys.stderr, flush=True)
+    reply(chat_id, f"Started background job {job_id}. You'll get a message here when it finishes.", thread_id)
+
+
+def jobs_summary():
+    jobs = CLAUDE.list_jobs()
+    if not jobs:
+        return "No background jobs running."
+    now = time.time()
+    lines = [f"{job_id} ({int(now - job['started'])}s, thread {job['thread_id']}): {job['prompt'][:80]}" for job_id, job in jobs]
+    return "\n".join(lines)
+
+
+def cancel_job(job_id):
+    return f"Cancelled {job_id}." if CLAUDE.cancel_job(job_id) else f"No running background job {job_id}."
+
+
+def run_shell(command):
+    """Runs `command` directly (not through tmux) and returns its combined
+    stdout/stderr, unlike /tmux which types into the long-lived interactive
+    session."""
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=SH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {SH_TIMEOUT}s"
+    output = (result.stdout + result.stderr).strip() or "(no output)"
+    # Telegram messages are capped at 4096 characters.
+    return f"$ {command} (exit {result.returncode})\n{output}"[:4096]
+
+
+def run_sh(chat_id, thread_id, command):
+    """Run a /sh shell command on its own thread so it can't block Telegram
+    polling for up to SH_TIMEOUT seconds."""
+    try:
+        reply(chat_id, run_shell(command), thread_id)
+    except Exception as error:
+        print(f"telegram-claude-control: /sh failed: {error}", file=sys.stderr, flush=True)
+        reply(chat_id, f"/sh failed: {error}", thread_id)
+
+
 def send_terminal(text):
     typed = tmux("send-keys", "-t", SESSION, "-l", text)
     entered = tmux("send-keys", "-t", SESSION, "Enter")
@@ -362,6 +501,15 @@ def start_ask(chat_id, message_id, thread_id, prompt):
     except Exception as error:
         print(f"telegram-claude-control: reaction failed: {error}", file=sys.stderr, flush=True)
     threading.Thread(target=run_ask, args=(chat_id, thread_id, prompt), daemon=True).start()
+
+
+def start_sh(chat_id, message_id, thread_id, command):
+    """Acknowledge promptly, then run the shell command asynchronously."""
+    try:
+        acknowledge(chat_id, message_id)
+    except Exception as error:
+        print(f"telegram-claude-control: reaction failed: {error}", file=sys.stderr, flush=True)
+    threading.Thread(target=run_sh, args=(chat_id, thread_id, command), daemon=True).start()
 
 
 def permitted(chat_id, state):
@@ -396,6 +544,10 @@ def handle(message, state):
             "You get one message per edited file as the turn runs, then a final summary. "
             "/newsession: forget the headless conversation and start fresh. "
             "/tmux <text>: terminal input into the interactive session, then last 30 lines after 20 seconds. "
+            "/sh <command>: run a shell command directly and return its output. "
+            "/bg <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
+            "you get a message here the moment it finishes (or fails). "
+            "/jobs: list running background jobs. /cancel <job_id>: kill one. "
             "/screen, /status, /interrupt.",
             thread_id,
         )
@@ -420,6 +572,28 @@ def handle(message, state):
             threading.Thread(target=delayed_screen, args=(chat_id, thread_id), daemon=True).start()
         else:
             reply(chat_id, "Unable to reach the tmux session.", thread_id)
+    elif command == "/sh":
+        reply(chat_id, "Usage: /sh <command>", thread_id)
+    elif command.startswith("/sh "):
+        shell_command = command[4:].strip()
+        if shell_command:
+            start_sh(chat_id, message["message_id"], thread_id, shell_command)
+        else:
+            reply(chat_id, "Usage: /sh <command>", thread_id)
+    elif command == "/bg":
+        reply(chat_id, "Usage: /bg <prompt>", thread_id)
+    elif command.startswith("/bg "):
+        bg_prompt = command[4:].strip()
+        if bg_prompt:
+            start_bg(chat_id, message["message_id"], thread_id, bg_prompt)
+        else:
+            reply(chat_id, "Usage: /bg <prompt>", thread_id)
+    elif command == "/jobs":
+        reply(chat_id, jobs_summary(), thread_id)
+    elif command == "/cancel":
+        reply(chat_id, "Usage: /cancel <job_id>", thread_id)
+    elif command.startswith("/cancel "):
+        reply(chat_id, cancel_job(command[8:].strip()), thread_id)
     elif command == "/newsession":
         CLAUDE.reset(thread_id)
         reply(chat_id, "Headless conversation cleared. Next message starts a new claude -p session.", thread_id)
