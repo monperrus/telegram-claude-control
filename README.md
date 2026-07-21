@@ -21,7 +21,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
 | `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
-| `/jobs` | Lists running background jobs (id, elapsed time, prompt). |
+| `/jobs` | Lists the 8 most recent background jobs (icon, id, status, duration, prompt) — history survives a controller restart. |
+| `/jobs <job_id>` | Detail view: status, duration, thread, full prompt, and result/error. |
 | `/cancel <job_id>` | Kills a running background job. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
 | `/screen` | Picks a tmux session/window/pane via inline buttons across the whole tmux server, skipping straight to content wherever there's only one choice. |
@@ -74,6 +75,16 @@ time, since two processes can't safely share the same `--resume` session —
 a second request on the same topic is rejected with a "already running"
 reply rather than queued. Different topics run fully in parallel, so a
 long `/bg` job in one topic never blocks `/ask` in another.
+
+Every `/bg` job is logged to a small SQLite database
+(`TELEGRAM_CLAUDE_JOBS_DB`) as it starts and finishes, so `/jobs` history
+survives a controller restart even though the underlying `claude -p`
+subprocess itself can't: a job still marked "running" when the controller
+starts up is a leftover from a previous process and gets flagged
+"interrupted" rather than left looking falsely active. The conversation
+itself isn't lost either way — it's still resumable normally via `--resume`
+with a fresh `/ask` or `/bg` on the same topic — only that specific job's
+progress tracking ends at the interruption.
 
 `/screen` walks the *entire* tmux server, not just `TELEGRAM_CLAUDE_SESSION`
 — multiple sessions get a button per session, tapping one shows its windows,
@@ -180,6 +191,7 @@ Optional environment variables:
 | --- | --- | --- |
 | `TELEGRAM_CLAUDE_CONFIG` | `~/.config/telegram-claude-control.env` | Secret config file. |
 | `TELEGRAM_CLAUDE_STATE` | `~/.local/state/telegram-claude-control.json` | Pairing state and Telegram update offset. |
+| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/bg` jobs, for `/jobs` history across restarts. |
 | `TELEGRAM_CLAUDE_SESSION` | `claude` | tmux target session for the `/tmux` bridge. |
 | `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Working directory for headless `claude -p` calls. |
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |

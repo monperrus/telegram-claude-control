@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ import urllib.parse
 
 CONFIG_PATH = os.environ.get("TELEGRAM_CLAUDE_CONFIG", os.path.expanduser("~/.config/telegram-claude-control.env"))
 STATE_PATH = os.environ.get("TELEGRAM_CLAUDE_STATE", os.path.expanduser("~/.local/state/telegram-claude-control.json"))
+JOBS_DB_PATH = os.environ.get("TELEGRAM_CLAUDE_JOBS_DB", os.path.expanduser("~/.local/state/telegram-claude-control-jobs.db"))
 SESSION = os.environ.get("TELEGRAM_CLAUDE_SESSION", "claude")
 WORKSPACE = os.environ.get("TELEGRAM_CLAUDE_WORKSPACE", os.path.expanduser("~"))
 CLAUDE_BIN = os.environ.get("TELEGRAM_CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
@@ -245,21 +247,29 @@ class ClaudeHeadless:
         finally:
             lock.release()
 
-    def start_background(self, prompt, conversation_id, thread_id, notify):
+    def start_background(self, prompt, conversation_id, thread_id, notify, on_start=None, on_done=None):
         """Starts prompt as a background job that is not bound by
         ASK_TIMEOUT: it runs on a daemon thread owned by the long-lived
         controller process itself, so it survives well past any single
         `claude -p` process's lifetime. notify(text) is used both for
         progress messages and for the final completion/failure message,
-        exactly like the foreground path. Returns the new job_id, or None if
-        this conversation is already busy (foreground or another /bg job)."""
+        exactly like the foreground path. on_start(job_id) fires
+        synchronously, before the worker thread launches (so a caller that
+        wants to durably record "job started" can't race the job finishing
+        first); on_done(job_id, status, text) fires exactly once, with
+        status one of "completed"/"failed"/"cancelled". Returns the new
+        job_id, or None if this conversation is already busy (foreground or
+        another /bg job)."""
+        on_start = on_start or (lambda job_id: None)
+        on_done = on_done or (lambda job_id, status, text: None)
         lock = self._conversation_lock(conversation_id)
         if not lock.acquire(blocking=False):
             return None
         with self._jobs_lock:
             self._job_seq += 1
             job_id = f"bg{self._job_seq}"
-            self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None}
+            self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None, "cancelled": False}
+        on_start(job_id)
 
         def on_process(process):
             with self._jobs_lock:
@@ -270,8 +280,17 @@ class ClaudeHeadless:
             try:
                 result = self._execute(prompt, conversation_id, notify, BG_TIMEOUT, on_process=on_process)
                 notify(f"✅ Background job {job_id} finished:\n{result}")
+                on_done(job_id, "completed", result)
             except Exception as error:
-                notify(f"❌ Background job {job_id} failed: {_friendly_claude_error(error)}")
+                with self._jobs_lock:
+                    cancelled = self.jobs.get(job_id, {}).get("cancelled", False)
+                if cancelled:
+                    notify(f"🚫 Background job {job_id} was cancelled.")
+                    on_done(job_id, "cancelled", str(error))
+                else:
+                    friendly = _friendly_claude_error(error)
+                    notify(f"❌ Background job {job_id} failed: {friendly}")
+                    on_done(job_id, "failed", friendly)
             finally:
                 with self._jobs_lock:
                     self.jobs.pop(job_id, None)
@@ -280,15 +299,12 @@ class ClaudeHeadless:
         threading.Thread(target=worker, daemon=True).start()
         return job_id
 
-    def list_jobs(self):
-        with self._jobs_lock:
-            return [(job_id, dict(job)) for job_id, job in self.jobs.items()]
-
     def cancel_job(self, job_id):
         with self._jobs_lock:
             job = self.jobs.get(job_id)
-        if job is None or job["process"] is None:
-            return False
+            if job is None or job["process"] is None:
+                return False
+            job["cancelled"] = True
         job["process"].kill()
         return True
 
@@ -300,6 +316,75 @@ class ClaudeHeadless:
 
 
 CLAUDE = ClaudeHeadless()
+
+
+class JobStore:
+    """Durable log of /bg jobs (SQLite) so /jobs history and status survive
+    a controller restart -- unlike ClaudeHeadless's in-memory registry,
+    which only knows about jobs from the current process's lifetime. This is
+    a log, not a resumable queue: the underlying claude -p subprocess itself
+    cannot survive a restart, so any row still marked "running" at startup
+    is flagged "interrupted" (the conversation itself can still be continued
+    normally via --resume with a fresh /ask or /bg -- only that specific
+    job's progress tracking was lost)."""
+
+    def __init__(self, path):
+        self.path = path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._local = threading.local()
+        with self._connect() as db:
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    chat_id TEXT,
+                    thread_id TEXT,
+                    prompt TEXT,
+                    status TEXT,
+                    created_at REAL,
+                    finished_at REAL,
+                    result TEXT
+                )"""
+            )
+            db.execute("UPDATE jobs SET status = 'interrupted' WHERE status = 'running'")
+
+    def _connect(self):
+        # One connection per thread: sqlite3 connections aren't safe to share
+        # across threads, and start_bg/worker/handle() calls all come from
+        # different ones.
+        if not hasattr(self._local, "db"):
+            self._local.db = sqlite3.connect(self.path, timeout=30)
+        return self._local.db
+
+    def start(self, job_id, chat_id, thread_id, prompt):
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO jobs (job_id, chat_id, thread_id, prompt, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+                (job_id, str(chat_id), str(thread_id), prompt, time.time()),
+            )
+
+    def finish(self, job_id, status, result):
+        with self._connect() as db:
+            db.execute(
+                "UPDATE jobs SET status = ?, result = ?, finished_at = ? WHERE job_id = ?",
+                (status, (result or "")[:1500], time.time(), job_id),
+            )
+
+    def recent(self, limit=8):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT job_id, status, prompt, created_at, finished_at FROM jobs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def get(self, job_id):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+
+
+JOBS = JobStore(JOBS_DB_PATH)
 
 
 class TelegramApi:
@@ -569,8 +654,17 @@ def run_ask(chat_id, thread_id, prompt):
 def start_bg(chat_id, message_id, thread_id, prompt):
     """Start a /bg job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
     job can run for hours. notify (here, reply) delivers both progress and
-    the final completion/failure message whenever the job actually ends."""
-    job_id = CLAUDE.start_background(prompt, conversation_id=thread_id, thread_id=thread_id, notify=lambda text: reply(chat_id, text, thread_id))
+    the final completion/failure message whenever the job actually ends.
+    on_start/on_done record the job in JOBS (SQLite) so /jobs history and
+    status survive a controller restart."""
+    job_id = CLAUDE.start_background(
+        prompt,
+        conversation_id=thread_id,
+        thread_id=thread_id,
+        notify=lambda text: reply(chat_id, text, thread_id),
+        on_start=lambda job_id: JOBS.start(job_id, chat_id, thread_id, prompt),
+        on_done=lambda job_id, status, text: JOBS.finish(job_id, status, text),
+    )
     if job_id is None:
         reply(chat_id, "A request is already running for this conversation. Check /jobs, or wait for it to finish.", thread_id)
         return
@@ -581,12 +675,50 @@ def start_bg(chat_id, message_id, thread_id, prompt):
     reply(chat_id, f"Started background job {job_id}. You'll get a message here when it finishes.", thread_id)
 
 
+STATUS_ICONS = {"running": "🏃", "completed": "✅", "failed": "❌", "cancelled": "🚫", "interrupted": "⚠️"}
+
+
+def human_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h" if hours else f"{days}d"
+
+
 def jobs_summary():
-    jobs = CLAUDE.list_jobs()
-    if not jobs:
-        return "No background jobs running."
+    rows = JOBS.recent()
+    if not rows:
+        return "No background jobs yet."
     now = time.time()
-    lines = [f"{job_id} ({int(now - job['started'])}s, thread {job['thread_id']}): {job['prompt'][:80]}" for job_id, job in jobs]
+    lines = []
+    for job_id, status, prompt, created_at, finished_at in rows:
+        icon = STATUS_ICONS.get(status, "?")
+        duration = human_duration((finished_at or now) - created_at)
+        lines.append(f"{icon} {job_id} ({status}, {duration}): {prompt[:80]}")
+    return "\n".join(lines) + "\n\nDetail: /jobs <job_id>"
+
+
+def job_detail(job_id):
+    row = JOBS.get(job_id)
+    if row is None:
+        return f"No job {job_id}."
+    job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result = row
+    now = time.time()
+    lines = [
+        f"{STATUS_ICONS.get(status, '?')} {job_id} — {status}",
+        f"Duration: {human_duration((finished_at or now) - created_at)}",
+        f"Thread: {thread_id}",
+        f"Prompt: {prompt[:800]}",
+    ]
+    if result:
+        lines.append(f"Result: {result[:1500]}")
     return "\n".join(lines)
 
 
@@ -736,7 +868,8 @@ def handle(message, state):
             "/sh <command>: run a shell command directly and return its output. "
             "/bg <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
-            "/jobs: list running background jobs. /cancel <job_id>: kill one. "
+            "/jobs: list recent background jobs (survives a restart). /jobs <job_id>: detail. "
+            "/cancel <job_id>: kill a running one. "
             "/restart: restart the controller's systemd service. "
             "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
             "/status, /interrupt. "
@@ -792,6 +925,8 @@ def handle(message, state):
             reply(chat_id, "Usage: /bg <prompt>", thread_id)
     elif command == "/jobs":
         reply(chat_id, jobs_summary(), thread_id)
+    elif command.startswith("/jobs "):
+        reply(chat_id, job_detail(command[6:].strip()), thread_id)
     elif command == "/cancel":
         reply(chat_id, "Usage: /cancel <job_id>", thread_id)
     elif command.startswith("/cancel "):
