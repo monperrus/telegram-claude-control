@@ -39,6 +39,8 @@ BG_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_BG_TIMEOUT", "14400"))
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
 # systemd --user unit installed by install.sh; /restart targets this.
 UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.service")
+# /model button shortcuts; /model <any other id> is also accepted verbatim.
+MODEL_PRESETS = ["sonnet", "opus", "haiku"]
 
 
 def config():
@@ -136,14 +138,27 @@ class ClaudeHeadless:
     time -- otherwise one /bg job would freeze every other topic for as long
     as it runs."""
 
-    def __init__(self, sessions=None, on_change=None):
+    def __init__(self, sessions=None, models=None, on_change=None):
         self.sessions = sessions if sessions is not None else {}
+        self.models = models if models is not None else {}
         self.on_change = on_change or (lambda: None)
         self._locks_guard = threading.Lock()
         self._conversation_locks = {}
         self._jobs_lock = threading.Lock()
         self._job_seq = 0
         self.jobs = {}
+
+    def set_model(self, conversation_id, model):
+        """model=None resets the conversation to the CLI's own default."""
+        with STATE_LOCK:
+            if model:
+                self.models[str(conversation_id)] = model
+            else:
+                self.models.pop(str(conversation_id), None)
+        self.on_change()
+
+    def get_model(self, conversation_id):
+        return self.models.get(str(conversation_id))
 
     def _conversation_lock(self, conversation_id):
         key = str(conversation_id)
@@ -163,6 +178,9 @@ class ClaudeHeadless:
             args += ["--resume", session_id]
         if PERMISSION_MODE:
             args += ["--permission-mode", PERMISSION_MODE]
+        model = self.models.get(str(conversation_id))
+        if model:
+            args += ["--model", model]
         process = subprocess.Popen(
             args,
             cwd=WORKSPACE,
@@ -813,6 +831,7 @@ ONE_LETTER_SHORTCUTS = {
     "i": "/interrupt",
     "r": "/restart",
     "t": "/jobs",
+    "a": "/model",
 }
 # One letter plus " <argument>".
 PREFIXED_SHORTCUTS = {
@@ -820,6 +839,7 @@ PREFIXED_SHORTCUTS = {
     "m": "/tmux",
     "x": "/sh",
     "c": "/ask",
+    "a": "/model",
 }
 
 
@@ -872,9 +892,11 @@ def handle(message, state):
             "/cancel <job_id>: kill a running one. "
             "/restart: restart the controller's systemd service. "
             "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
+            "/model: show/pick the Claude model for this conversation (sonnet/opus/haiku or any model id); "
+            "/model default resets it. "
             "/status, /interrupt. "
             "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
-            "m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
+            "a=model (`a <name>` selects) m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
             thread_id,
         )
     elif command == "/screen":
@@ -939,6 +961,18 @@ def handle(message, state):
         error = restart_controller()
         if error:
             reply(chat_id, f"Restart failed: {error}", thread_id)
+    elif command == "/model":
+        current = CLAUDE.get_model(thread_id) or "(CLI default)"
+        buttons = [(name, f"/model {name}") for name in MODEL_PRESETS] + [("reset to default", "/model default")]
+        reply(chat_id, f"Model for this conversation: {current}\nPick one, or send /model <any model id>:", thread_id, buttons=buttons)
+    elif command.startswith("/model "):
+        model_name = command[7:].strip()
+        if model_name in ("default", "reset", "clear", ""):
+            CLAUDE.set_model(thread_id, None)
+            reply(chat_id, "Model reset to the CLI default for this conversation.", thread_id)
+        else:
+            CLAUDE.set_model(thread_id, model_name)
+            reply(chat_id, f"Model set to {model_name} for this conversation (takes effect next turn).", thread_id)
     elif command == "/newsession":
         CLAUDE.reset(thread_id)
         reply(chat_id, "Headless conversation cleared. Next message starts a new claude -p session.", thread_id)
@@ -982,6 +1016,7 @@ def main():
     # Reuse the same dict object (not a copy) so mutations CLAUDE makes to it
     # are already reflected in the next write_state(state) call below.
     CLAUDE.sessions = state.setdefault("sessions", {})
+    CLAUDE.models = state.setdefault("models", {})
     CLAUDE.on_change = lambda: write_state(state)
     try:
         # Establish the sender's TLS connection before the first user message,

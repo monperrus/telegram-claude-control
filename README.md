@@ -18,6 +18,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | --- | --- |
 | Normal text or `/ask <prompt>` | Runs `claude -p` headless (`--output-format stream-json`), continuing the same Claude Code session via `--resume` across turns. |
 | `/newsession` | Forgets the headless session ID for this conversation; the next message starts a fresh `claude -p` session. |
+| `/model` | Shows the model for this conversation and offers `sonnet`/`opus`/`haiku` as buttons. |
+| `/model <name>` | Sets `--model <name>` for this conversation's `claude -p` calls (`/model default` clears it). |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
 | `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
@@ -55,14 +57,20 @@ translated into a short, plain-English message instead of a raw error dump.
 
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
 `v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/bg`
-(`t <prompt>`) `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=
-`/ask <prompt>`. Only an exact `<letter>` or `<letter> <rest>` triggers a
-shortcut — anything else (including sentences that happen to start with one
-of these letters, e.g. "im on my way") falls through to the normal `/ask`
-prompt path unchanged. The one exception is `x`/`m`/`t`/`c`: a message that
+(`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`)
+`m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=`/ask <prompt>`.
+Only an exact `<letter>` or `<letter> <rest>` triggers a shortcut —
+anything else (including sentences that happen to start with one of these
+letters, e.g. "im on my way") falls through to the normal `/ask` prompt path
+unchanged. The one exception is `x`/`m`/`t`/`c`/`a`: a message that
 genuinely starts with one of those letters followed by a space (e.g. "x-ray"
 typed as "x ray gun") will be misread as a shortcut — say it another way, or
-use the full `/sh`/`/tmux`/`/bg`/`/ask` command instead.
+use the full `/sh`/`/tmux`/`/bg`/`/ask`/`/model` command instead.
+
+The per-conversation model choice (`/model`) is persisted the same way the
+`--resume` session id is — it survives a controller restart and is
+independent of `/newsession`, which only clears the conversation history,
+not the model.
 
 The first chat must pair using a secret pairing code. Once paired, messages
 from all other chats are silently ignored. In Telegram forum groups, each
@@ -218,10 +226,11 @@ Optional environment variables:
 - The sender connection is warmed at startup and kept alive to minimize the
   delay before the acknowledgement reaction. Long polling uses a separate
   connection so it never blocks an acknowledgement or final reply.
-- The state file is written with mode `0600` and records the paired chat ID
-  (not the Claude session ID, which lives only in the running process's
-  memory and resets on restart). Delete the state file to allow pairing a
-  different chat.
+- The state file is written with mode `0600` and records the paired chat ID,
+  each conversation's `--resume` session id, and each conversation's
+  `/model` choice — all of which survive a controller restart. Delete the
+  state file to allow pairing a different chat (this also forgets every
+  conversation's session and model).
 - Outgoing Telegram text is capped at the API's 4096-character limit; tmux
   output is trimmed to recent lines for the same reason.
 
