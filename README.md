@@ -24,7 +24,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/jobs` | Lists running background jobs (id, elapsed time, prompt). |
 | `/cancel <job_id>` | Kills a running background job. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
-| `/screen` | Returns recent output from that tmux session. |
+| `/screen` | Picks a tmux session/window/pane via inline buttons across the whole tmux server, skipping straight to content wherever there's only one choice. |
+| `/screen_show <target>` | Captures and returns a specific tmux target directly (e.g. `web:1`, `web:1.0`) — what the `/screen` buttons call under the hood. |
 | `/status` | Reports whether the tmux session exists. |
 | `/interrupt` | Sends Ctrl-C to the tmux session. |
 
@@ -73,6 +74,17 @@ time, since two processes can't safely share the same `--resume` session —
 a second request on the same topic is rejected with a "already running"
 reply rather than queued. Different topics run fully in parallel, so a
 long `/bg` job in one topic never blocks `/ask` in another.
+
+`/screen` walks the *entire* tmux server, not just `TELEGRAM_CLAUDE_SESSION`
+— multiple sessions get a button per session, tapping one shows its windows,
+tapping a window shows its panes, and tapping a pane captures it. Each level
+is skipped automatically when there's only one choice, so a single-session,
+single-window, single-pane setup (the common case) still returns content
+immediately on a bare `/screen`, same as before. Button taps are Telegram
+`callback_query` updates: the bot acknowledges them (so the client stops
+showing a spinner) and replays the button's payload through the same command
+dispatcher a typed message would use — a `/screen` button is, under the
+hood, just `/screen_show <target>` sent on your behalf.
 
 ## Requirements
 

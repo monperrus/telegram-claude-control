@@ -443,13 +443,79 @@ def tmux(*args, input_text=None):
     return subprocess.run(["tmux", *args], input=input_text, text=True, capture_output=True, timeout=15)
 
 
-def screen(lines=120):
-    result = tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", SESSION)
+def screen(lines=120, target=None):
+    result = tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", target or SESSION)
     if result.returncode:
         return "tmux session is unavailable: " + result.stderr.strip()
     output = result.stdout.strip() or "(terminal is blank)"
     # Telegram messages are capped at 4096 characters.
     return output[-3800:]
+
+
+def list_tmux_sessions():
+    result = tmux("list-sessions", "-F", "#{session_name}")
+    return [line for line in result.stdout.splitlines() if line] if result.returncode == 0 else []
+
+
+def list_tmux_windows(session):
+    """[(window_target, window_name), ...] for every window in session."""
+    result = tmux("list-windows", "-t", session, "-F", "#{session_name}:#{window_index} #{window_name}")
+    if result.returncode:
+        return []
+    pairs = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        target, _, name = line.partition(" ")
+        pairs.append((target, name or target))
+    return pairs
+
+
+def list_tmux_panes(window_target):
+    """[(pane_target, pane_title), ...] for every pane in window_target."""
+    result = tmux("list-panes", "-t", window_target, "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_title}")
+    if result.returncode:
+        return []
+    pairs = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        target, _, title = line.partition(" ")
+        pairs.append((target, title or target))
+    return pairs
+
+
+def screen_entry():
+    """Picks the narrowest useful tmux picker step: a session/window/pane
+    level is skipped whenever it has only one choice, all the way down to
+    capturing content directly when the whole server has exactly one pane.
+    Returns (text, buttons) -- buttons is None when text is the final
+    captured content rather than a menu prompt."""
+    sessions = list_tmux_sessions()
+    if not sessions:
+        return "tmux is unavailable: no sessions.", None
+    if len(sessions) == 1:
+        return screen_windows_entry(sessions[0])
+    return "Pick a tmux session:", [(name, f"/screen_windows {name}") for name in sessions]
+
+
+def screen_windows_entry(session):
+    windows = list_tmux_windows(session)
+    if not windows:
+        return f"No windows in session {session}.", None
+    if len(windows) == 1:
+        return screen_panes_entry(windows[0][0])
+    return f"Pick a window in {session}:", [(f"{session} — {name}", f"/screen_panes {target}") for target, name in windows]
+
+
+def screen_panes_entry(window_target):
+    panes = list_tmux_panes(window_target)
+    if not panes:
+        return f"No panes in {window_target}.", None
+    if len(panes) == 1:
+        return screen(target=panes[0][0]), None
+    buttons = [(f"{target} — {title}" if title and title != target else target, f"/screen_show {target}") for target, title in panes]
+    return f"Pick a pane in {window_target}:", buttons
 
 
 def restart_controller():
@@ -563,11 +629,16 @@ def send_terminal(text):
     return typed.returncode == 0 and entered.returncode == 0
 
 
-def reply(chat_id, text, thread_id=None):
+def reply(chat_id, text, thread_id=None, buttons=None):
+    """buttons, if given, is [(label, callback_data), ...], rendered as one
+    inline button per row."""
     # Plain text avoids Telegram markup interpretation of terminal output.
     payload = {"chat_id": chat_id, "text": text[:4096]}
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if buttons:
+        keyboard = [[{"text": label, "callback_data": data}] for label, data in buttons]
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     api("sendMessage", payload)
 
 
@@ -667,13 +738,23 @@ def handle(message, state):
             "you get a message here the moment it finishes (or fails). "
             "/jobs: list running background jobs. /cancel <job_id>: kill one. "
             "/restart: restart the controller's systemd service. "
-            "/screen, /status, /interrupt. "
+            "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
+            "/status, /interrupt. "
             "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
             "m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
             thread_id,
         )
     elif command == "/screen":
-        reply(chat_id, screen(), thread_id)
+        text, buttons = screen_entry()
+        reply(chat_id, text, thread_id, buttons=buttons)
+    elif command.startswith("/screen_windows "):
+        text, buttons = screen_windows_entry(command[16:].strip())
+        reply(chat_id, text, thread_id, buttons=buttons)
+    elif command.startswith("/screen_panes "):
+        text, buttons = screen_panes_entry(command[14:].strip())
+        reply(chat_id, text, thread_id, buttons=buttons)
+    elif command.startswith("/screen_show "):
+        reply(chat_id, screen(target=command[13:].strip()), thread_id)
     elif command == "/status":
         result = tmux("has-session", "-t", SESSION)
         reply(chat_id, f"tmux session '{SESSION}': " + ("available" if result.returncode == 0 else "unavailable"), thread_id)
@@ -740,6 +821,27 @@ def handle(message, state):
         start_ask(chat_id, message["message_id"], thread_id, text)
 
 
+def handle_callback(callback_query, state):
+    """An inline-button tap: acknowledge it (required so Telegram stops
+    showing a loading spinner on the button), then replay its callback_data
+    through the same handle() dispatcher a typed command would use -- e.g. a
+    /screen picker button's callback_data is literally "/screen_panes ..."."""
+    try:
+        api("answerCallbackQuery", {"callback_query_id": callback_query["id"]})
+    except Exception as error:
+        print(f"telegram-claude-control: answerCallbackQuery failed: {error}", file=sys.stderr, flush=True)
+    message = callback_query.get("message") or {}
+    if not message.get("chat"):
+        return
+    synthetic = {
+        "chat": message["chat"],
+        "message_id": message.get("message_id"),
+        "message_thread_id": message.get("message_thread_id"),
+        "text": callback_query.get("data", ""),
+    }
+    handle(synthetic, state)
+
+
 def main():
     state = read_state()
     # Reuse the same dict object (not a copy) so mutations CLAUDE makes to it
@@ -754,10 +856,13 @@ def main():
         print(f"telegram-claude-control: sender preflight failed: {error}", file=sys.stderr, flush=True)
     while True:
         try:
-            updates = api("getUpdates", {"offset": state.get("offset", 0), "timeout": 30, "allowed_updates": json.dumps(["message"])})
+            updates = api("getUpdates", {"offset": state.get("offset", 0), "timeout": 30, "allowed_updates": json.dumps(["message", "callback_query"])})
             for update in updates:
                 state["offset"] = update["update_id"] + 1
-                handle(update.get("message", {}), state)
+                if "callback_query" in update:
+                    handle_callback(update["callback_query"], state)
+                else:
+                    handle(update.get("message", {}), state)
                 write_state(state)
         except KeyboardInterrupt:
             return
