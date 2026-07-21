@@ -56,6 +56,14 @@ each completed tool call, so a slow reply doesn't look like a dropped
 message. Common `claude -p` failures (rate limits, an overloaded API) are
 translated into a short, plain-English message instead of a raw error dump.
 
+Commands are tappable two ways: `/help`'s reply carries inline buttons for
+every command that needs no argument (`usage`, `status`, `screen`, `jobs`,
+`model`, `interrupt`, `newsession`, `restart`), and the controller registers
+the full command list with Telegram (`setMyCommands`) at startup, so typing
+`/` in any client brings up the native autocomplete menu with descriptions
+— tap one to insert `/command ` and just type the argument for commands
+like `/ask`, `/bg`, `/sh`, `/tmux`, `/cancel`, `/model <name>`.
+
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
 `v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/bg`
 (`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`) `u`=`/usage`

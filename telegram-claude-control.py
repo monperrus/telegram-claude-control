@@ -46,6 +46,29 @@ UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.s
 # /model button shortcuts; /model <any other id> is also accepted verbatim.
 MODEL_PRESETS = ["sonnet", "opus", "haiku"]
 
+# Registered with Telegram via setMyCommands so typing "/" brings up a
+# tappable, autocompleted menu (with descriptions) in any Telegram client --
+# in addition to the /help message's own inline buttons for the
+# no-argument commands. Internal-only commands driven exclusively by
+# /screen's own buttons (/screen_windows, /screen_panes, /screen_show) are
+# left out, same as they're left out of /help's text.
+BOT_COMMANDS = [
+    ("help", "Show available commands"),
+    ("ask", "Headless claude -p with a prompt (or just send plain text)"),
+    ("newsession", "Forget this conversation and start fresh"),
+    ("model", "Show/pick the Claude model for this conversation"),
+    ("usage", "Current session/weekly usage against your plan limits"),
+    ("bg", "Run claude -p in the background, no timeout"),
+    ("jobs", "List recent background jobs"),
+    ("cancel", "Cancel a running background job"),
+    ("sh", "Run a shell command directly"),
+    ("tmux", "Type text into the interactive tmux session"),
+    ("screen", "Capture tmux session/window/pane output"),
+    ("status", "Report tmux session status"),
+    ("interrupt", "Send Ctrl-C to the tmux session"),
+    ("restart", "Restart the controller service"),
+]
+
 
 def config():
     values = {}
@@ -808,17 +831,28 @@ def send_terminal(text):
     return typed.returncode == 0 and entered.returncode == 0
 
 
-def reply(chat_id, text, thread_id=None, buttons=None):
-    """buttons, if given, is [(label, callback_data), ...], rendered as one
-    inline button per row."""
+def reply(chat_id, text, thread_id=None, buttons=None, columns=1):
+    """buttons, if given, is [(label, callback_data), ...], packed columns
+    per row (default: one per row -- wide labels like tmux target names
+    need the room; short ones, e.g. /help's action buttons, look better
+    packed two or three per row)."""
     # Plain text avoids Telegram markup interpretation of terminal output.
     payload = {"chat_id": chat_id, "text": text[:4096]}
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
     if buttons:
-        keyboard = [[{"text": label, "callback_data": data}] for label, data in buttons]
+        rows = [buttons[i:i + columns] for i in range(0, len(buttons), columns)]
+        keyboard = [[{"text": label, "callback_data": data} for label, data in row] for row in rows]
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     api("sendMessage", payload)
+
+
+def register_bot_commands():
+    """Registers BOT_COMMANDS with Telegram (setMyCommands) so every client
+    shows a tappable "/" menu with descriptions, letting the user pick a
+    command and just type its argument -- complements, but doesn't replace,
+    /help's own inline buttons for the no-argument commands."""
+    api("setMyCommands", {"commands": json.dumps([{"command": name, "description": description} for name, description in BOT_COMMANDS])})
 
 
 def acknowledge(chat_id, message_id):
@@ -927,9 +961,17 @@ def handle(message, state):
             "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
             "/status, /interrupt. "
             "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
-            "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
+            "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask. "
+            "Tap a button below for the commands that need no arguments, or type / for Telegram's own "
+            "command menu (with the rest, autocompleted so you can just add the argument).",
             thread_id,
-            buttons=[("usage", "/usage")],
+            buttons=[
+                ("usage", "/usage"), ("status", "/status"),
+                ("screen", "/screen"), ("jobs", "/jobs"),
+                ("model", "/model"), ("interrupt", "/interrupt"),
+                ("newsession", "/newsession"), ("restart", "/restart"),
+            ],
+            columns=2,
         )
     elif command == "/usage":
         reply(chat_id, usage_report(), thread_id)
@@ -1058,6 +1100,10 @@ def main():
         api("getMe")
     except Exception as error:
         print(f"telegram-claude-control: sender preflight failed: {error}", file=sys.stderr, flush=True)
+    try:
+        register_bot_commands()
+    except Exception as error:
+        print(f"telegram-claude-control: setMyCommands failed: {error}", file=sys.stderr, flush=True)
     while True:
         try:
             updates = api("getUpdates", {"offset": state.get("offset", 0), "timeout": 30, "allowed_updates": json.dumps(["message", "callback_query"])})
