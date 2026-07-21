@@ -44,7 +44,22 @@ file reads), with each changed line's indentation and trailing whitespace
 stripped to stay readable on a phone. When a change touches
 `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` (default 10) lines or more, only the
 `(+added -removed)` counts are shown, not the full diff. A 🫡 reaction on
-your message acknowledges receipt immediately, before the turn finishes.
+your message acknowledges receipt immediately, before the turn finishes. A
+"typing…" indicator also stays up for the whole `/ask` turn, refreshed on
+each completed tool call, so a slow reply doesn't look like a dropped
+message. Common `claude -p` failures (rate limits, an overloaded API) are
+translated into a short, plain-English message instead of a raw error dump.
+
+One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
+`v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/bg`
+(`t <prompt>`) `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=
+`/ask <prompt>`. Only an exact `<letter>` or `<letter> <rest>` triggers a
+shortcut — anything else (including sentences that happen to start with one
+of these letters, e.g. "im on my way") falls through to the normal `/ask`
+prompt path unchanged. The one exception is `x`/`m`/`t`/`c`: a message that
+genuinely starts with one of those letters followed by a space (e.g. "x-ray"
+typed as "x ray gun") will be misread as a shortcut — say it another way, or
+use the full `/sh`/`/tmux`/`/bg`/`/ask` command instead.
 
 The first chat must pair using a secret pairing code. Once paired, messages
 from all other chats are silently ignored. In Telegram forum groups, each

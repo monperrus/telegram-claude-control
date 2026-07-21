@@ -268,7 +268,7 @@ class ClaudeHeadless:
                 result = self._execute(prompt, conversation_id, notify, BG_TIMEOUT, on_process=on_process)
                 notify(f"✅ Background job {job_id} finished:\n{result}")
             except Exception as error:
-                notify(f"❌ Background job {job_id} failed: {error}")
+                notify(f"❌ Background job {job_id} failed: {_friendly_claude_error(error)}")
             finally:
                 with self._jobs_lock:
                     self.jobs.pop(job_id, None)
@@ -324,7 +324,9 @@ class TelegramApi:
             "Connection": "keep-alive",
         }
         # A server may close an idle keep-alive connection. Reconnect once so
-        # that an idle bot does not fail its first reply.
+        # that an idle bot does not fail its first reply. A 409 means another
+        # getUpdates call briefly overlapped this one (e.g. right after a
+        # restart) -- also worth one retry rather than surfacing as an error.
         with self.lock:
             for attempt in range(2):
                 try:
@@ -332,6 +334,9 @@ class TelegramApi:
                     connection.request("POST", API_PREFIX + method, data, headers)
                     response = connection.getresponse()
                     body = response.read()
+                    if response.status == 409 and not attempt:
+                        self._discard_connection()
+                        continue
                     if response.status >= 400:
                         raise RuntimeError(f"Telegram API returned HTTP {response.status}")
                     result = json.loads(body)
@@ -353,6 +358,57 @@ SEND_API = TelegramApi()
 def api(method, payload=None):
     client = POLL_API if method == "getUpdates" else SEND_API
     return client.call(method, payload)
+
+
+def _friendly_claude_error(error):
+    """Best-effort translation of a raw claude -p failure into short,
+    Telegram-friendly text -- recognized failure classes (rate limits,
+    overload) get a plain explanation instead of a raw stack/API dump."""
+    text = str(error).strip()
+    lowered = text.lower()
+    if "429" in text or "rate limit" in lowered:
+        return "Claude's rate limit was hit (HTTP 429). No reply was produced -- please try again later."
+    if "usage limit" in lowered:
+        return "Claude's usage limit was reached. Please try again later."
+    if "529" in text or "overloaded" in lowered:
+        return "Claude's API is overloaded right now. Please try again shortly."
+    return text or "claude -p request failed."
+
+
+class TypingIndicator:
+    """Keeps a chat's "typing..." indicator up for the duration of a turn:
+    Telegram only shows it for a few seconds per call, so this refreshes it
+    on a timer (and on demand, e.g. per completed tool call) until stop()."""
+
+    INTERVAL = 4
+
+    def __init__(self, chat_id, thread_id):
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def ping(self):
+        try:
+            payload = {"chat_id": self.chat_id, "action": "typing"}
+            if self.thread_id is not None:
+                payload["message_thread_id"] = self.thread_id
+            api("sendChatAction", payload)
+        except Exception as error:
+            print(f"telegram-claude-control: typing indicator failed: {error}", file=sys.stderr, flush=True)
+
+    def _run(self):
+        while not self._stop.wait(self.INTERVAL):
+            self.ping()
+
+    def __enter__(self):
+        self.ping()
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        self._thread.join(timeout=1)
 
 
 # Guards both the on-disk state file and the in-memory `sessions` dict it
@@ -405,13 +461,20 @@ def delayed_screen(chat_id, thread_id):
 
 def run_ask(chat_id, thread_id, prompt):
     """Run a headless `claude -p` request on its own thread, relaying one
-    Telegram message per edited file as the turn progresses."""
-    try:
-        answer = CLAUDE.run(prompt, conversation_id=thread_id, notify=lambda text: reply(chat_id, text, thread_id))
-        reply(chat_id, answer, thread_id)
-    except Exception as error:
-        print(f"telegram-claude-control: headless request failed: {error}", file=sys.stderr, flush=True)
-        reply(chat_id, f"claude -p request failed: {error}", thread_id)
+    Telegram message per edited file as the turn progresses. A "typing..."
+    indicator stays up for the whole turn so a slow reply doesn't look like
+    a dropped message, refreshed on each completed tool call."""
+    with TypingIndicator(chat_id, thread_id) as typing:
+        def notify(text):
+            typing.ping()
+            reply(chat_id, text, thread_id)
+
+        try:
+            answer = CLAUDE.run(prompt, conversation_id=thread_id, notify=notify)
+            reply(chat_id, answer, thread_id)
+        except Exception as error:
+            print(f"telegram-claude-control: headless request failed: {error}", file=sys.stderr, flush=True)
+            reply(chat_id, _friendly_claude_error(error), thread_id)
 
 
 def start_bg(chat_id, message_id, thread_id, prompt):
@@ -516,6 +579,37 @@ def permitted(chat_id, state):
     return str(state.get("chat_id", "")) == str(chat_id)
 
 
+# Bare one-letter shortcuts (no argument).
+ONE_LETTER_SHORTCUTS = {
+    "h": "/help",
+    "s": "/status",
+    "v": "/screen",
+    "i": "/interrupt",
+    "r": "/restart",
+    "t": "/jobs",
+}
+# One letter plus " <argument>".
+PREFIXED_SHORTCUTS = {
+    "t": "/bg",
+    "m": "/tmux",
+    "x": "/sh",
+    "c": "/ask",
+}
+
+
+def expand_shortcut(command):
+    """Expands one-letter shortcuts (h/s/v/i/r/t/m/x/c) to their full command
+    form. Only exact matches trigger: a message that happens to start with
+    one of these letters but isn't "<letter>" or "<letter> <rest>" (e.g. an
+    ordinary sentence) falls through unchanged to the normal /ask prompt
+    path."""
+    if command in ONE_LETTER_SHORTCUTS:
+        return ONE_LETTER_SHORTCUTS[command]
+    if len(command) > 2 and command[1] == " " and command[0] in PREFIXED_SHORTCUTS:
+        return f"{PREFIXED_SHORTCUTS[command[0]]} {command[2:]}"
+    return command
+
+
 def handle(message, state):
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text")
@@ -537,6 +631,7 @@ def handle(message, state):
     if not permitted(chat_id, state):
         # Do not reveal that a controller exists to unapproved chats.
         return
+    command = expand_shortcut(command)
     if command in ("/start", "/help"):
         reply(
             chat_id,
@@ -548,7 +643,9 @@ def handle(message, state):
             "/bg <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
             "/jobs: list running background jobs. /cancel <job_id>: kill one. "
-            "/screen, /status, /interrupt.",
+            "/screen, /status, /interrupt. "
+            "One-letter shortcuts: h=help s=status v=screen i=interrupt t=jobs (`t <prompt>`=/bg) "
+            "m <text>=/tmux x <cmd>=/sh c <prompt>=/ask.",
             thread_id,
         )
     elif command == "/screen":
