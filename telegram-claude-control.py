@@ -60,7 +60,7 @@ BOT_COMMANDS = [
     ("model", "Show/pick the Claude model for this conversation"),
     ("usage", "Current session/weekly usage against your plan limits"),
     ("task", "Run claude -p in the background, no timeout"),
-    ("jobs", "List recent background jobs"),
+    ("tasks", "List recent background jobs"),
     ("cancel", "Cancel a running background job"),
     ("sh", "Run a shell command directly"),
     ("tmux", "Type text into the interactive tmux session"),
@@ -286,7 +286,7 @@ class ClaudeHeadless:
         notify = notify or (lambda text: None)
         lock = self._conversation_lock(conversation_id)
         if not lock.acquire(blocking=False):
-            raise RuntimeError("A request is already running for this conversation. Check /jobs, or wait for it to finish.")
+            raise RuntimeError("A request is already running for this conversation. Check /tasks, or wait for it to finish.")
         try:
             return self._execute(prompt, conversation_id, notify, ASK_TIMEOUT)
         finally:
@@ -378,7 +378,7 @@ CLAUDE = ClaudeHeadless()
 
 
 class JobStore:
-    """Durable log of /task jobs (SQLite) so /jobs history and status survive
+    """Durable log of /task jobs (SQLite) so /tasks history and status survive
     a controller restart -- unlike ClaudeHeadless's in-memory registry,
     which only knows about jobs from the current process's lifetime. This is
     a log, not a resumable queue: the underlying claude -p subprocess itself
@@ -714,7 +714,7 @@ def start_task(chat_id, message_id, thread_id, prompt):
     """Start a /task job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
     job can run for hours. notify (here, reply) delivers both progress and
     the final completion/failure message whenever the job actually ends.
-    on_start/on_done record the job in JOBS (SQLite) so /jobs history and
+    on_start/on_done record the job in JOBS (SQLite) so /tasks history and
     status survive a controller restart."""
     job_id = CLAUDE.start_background(
         prompt,
@@ -725,7 +725,7 @@ def start_task(chat_id, message_id, thread_id, prompt):
         on_done=lambda job_id, status, text: JOBS.finish(job_id, status, text),
     )
     if job_id is None:
-        reply(chat_id, "A request is already running for this conversation. Check /jobs, or wait for it to finish.", thread_id)
+        reply(chat_id, "A request is already running for this conversation. Check /tasks, or wait for it to finish.", thread_id)
         return
     try:
         acknowledge(chat_id, message_id)
@@ -751,7 +751,7 @@ def human_duration(seconds):
     return f"{days}d {hours}h" if hours else f"{days}d"
 
 
-def jobs_summary():
+def tasks_summary():
     rows = JOBS.recent()
     if not rows:
         return "No background jobs yet."
@@ -761,7 +761,7 @@ def jobs_summary():
         icon = STATUS_ICONS.get(status, "?")
         duration = human_duration((finished_at or now) - created_at)
         lines.append(f"{icon} {job_id} ({status}, {duration}): {prompt[:80]}")
-    return "\n".join(lines) + "\n\nDetail: /jobs <job_id>"
+    return "\n".join(lines) + "\n\nDetail: /tasks <job_id>"
 
 
 def job_detail(job_id):
@@ -907,7 +907,7 @@ ONE_LETTER_SHORTCUTS = {
     "v": "/screen",
     "i": "/interrupt",
     "r": "/restart",
-    "t": "/jobs",
+    "t": "/tasks",
     "a": "/model",
     "u": "/usage",
 }
@@ -966,7 +966,7 @@ def handle(message, state):
             "/sh <command>: run a shell command directly and return its output. "
             "/task <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
-            "/jobs: list recent background jobs (survives a restart). /jobs <job_id>: detail. "
+            "/tasks: list recent background jobs (survives a restart). /tasks <job_id>: detail. "
             "/cancel <job_id>: kill a running one. "
             "/restart: restart the controller's systemd service. "
             "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
@@ -974,14 +974,14 @@ def handle(message, state):
             "/model default resets it. "
             "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
             "/status, /interrupt. "
-            "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/task) "
+            "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=tasks (`t <prompt>`=/task) "
             "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask. "
             "Tap a button below for the commands that need no arguments, or type / for Telegram's own "
             "command menu (with the rest, autocompleted so you can just add the argument).",
             thread_id,
             buttons=[
                 ("usage", "/usage"), ("status", "/status"),
-                ("screen", "/screen"), ("jobs", "/jobs"),
+                ("screen", "/screen"), ("tasks", "/tasks"),
                 ("model", "/model"), ("interrupt", "/interrupt"),
                 ("newsession", "/newsession"), ("restart", "/restart"),
             ],
@@ -1035,10 +1035,10 @@ def handle(message, state):
             start_task(chat_id, message["message_id"], thread_id, task_prompt)
         else:
             reply(chat_id, "Usage: /task <prompt>", thread_id)
-    elif command == "/jobs":
-        reply(chat_id, jobs_summary(), thread_id)
-    elif command.startswith("/jobs "):
-        reply(chat_id, job_detail(command[6:].strip()), thread_id)
+    elif command == "/tasks":
+        reply(chat_id, tasks_summary(), thread_id)
+    elif command.startswith("/tasks "):
+        reply(chat_id, job_detail(command[7:].strip()), thread_id)
     elif command == "/cancel":
         reply(chat_id, "Usage: /cancel <job_id>", thread_id)
     elif command.startswith("/cancel "):

@@ -24,8 +24,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
 | `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
-| `/jobs` | Lists the 8 most recent background jobs (icon, id, status, duration, prompt) — history survives a controller restart. |
-| `/jobs <job_id>` | Detail view: status, duration, thread, full prompt, and result/error. |
+| `/tasks` | Lists the 8 most recent background jobs (icon, id, status, duration, prompt) — history survives a controller restart. |
+| `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and result/error. |
 | `/cancel <job_id>` | Kills a running background job. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
 | `/screen` | Picks a tmux session/window/pane via inline buttons across the whole tmux server, skipping straight to content wherever there's only one choice. |
@@ -57,7 +57,7 @@ message. Common `claude -p` failures (rate limits, an overloaded API) are
 translated into a short, plain-English message instead of a raw error dump.
 
 Commands are tappable two ways: `/help`'s reply carries inline buttons for
-every command that needs no argument (`usage`, `status`, `screen`, `jobs`,
+every command that needs no argument (`usage`, `status`, `screen`, `tasks`,
 `model`, `interrupt`, `newsession`, `restart`), and the controller registers
 the full command list with Telegram (`setMyCommands`) at startup, so typing
 `/` in any client brings up the native autocomplete menu with descriptions
@@ -65,7 +65,7 @@ the full command list with Telegram (`setMyCommands`) at startup, so typing
 like `/ask`, `/task`, `/sh`, `/tmux`, `/cancel`, `/model <name>`.
 
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
-`v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/task`
+`v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/tasks` (bare) or `/task`
 (`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`) `u`=`/usage`
 `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=`/ask <prompt>`.
 Only an exact `<letter>` or `<letter> <rest>` triggers a shortcut —
@@ -101,7 +101,7 @@ reply rather than queued. Different topics run fully in parallel, so a
 long `/task` job in one topic never blocks `/ask` in another.
 
 Every `/task` job is logged to a small SQLite database
-(`TELEGRAM_CLAUDE_JOBS_DB`) as it starts and finishes, so `/jobs` history
+(`TELEGRAM_CLAUDE_JOBS_DB`) as it starts and finishes, so `/tasks` history
 survives a controller restart even though the underlying `claude -p`
 subprocess itself can't: a job still marked "running" when the controller
 starts up is a leftover from a previous process and gets flagged
@@ -215,7 +215,7 @@ Optional environment variables:
 | --- | --- | --- |
 | `TELEGRAM_CLAUDE_CONFIG` | `~/.config/telegram-claude-control.env` | Secret config file. |
 | `TELEGRAM_CLAUDE_STATE` | `~/.local/state/telegram-claude-control.json` | Pairing state and Telegram update offset. |
-| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/task` jobs, for `/jobs` history across restarts. |
+| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/task` jobs, for `/tasks` history across restarts. |
 | `TELEGRAM_CLAUDE_SESSION` | `claude` | tmux target session for the `/tmux` bridge. |
 | `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Working directory for headless `claude -p` calls. |
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
