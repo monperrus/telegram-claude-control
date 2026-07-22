@@ -50,9 +50,8 @@ MODEL_PRESETS = ["sonnet", "opus", "haiku"]
 # Registered with Telegram via setMyCommands so typing "/" brings up a
 # tappable, autocompleted menu (with descriptions) in any Telegram client --
 # in addition to the /help message's own inline buttons for the
-# no-argument commands. Internal-only commands driven exclusively by
-# /screen's own buttons (/screen_windows, /screen_panes, /screen_show) are
-# left out, same as they're left out of /help's text.
+# no-argument commands. /screen_show, driven exclusively by /screen's own
+# buttons, is left out, same as it's left out of /help's text.
 BOT_COMMANDS = [
     ("help", "Show available commands"),
     ("ask", "Headless claude -p with a prompt (or just send plain text)"),
@@ -630,36 +629,19 @@ def list_tmux_panes(window_target):
 
 
 def screen_entry():
-    """Picks the narrowest useful tmux picker step: a session/window/pane
-    level is skipped whenever it has only one choice, all the way down to
-    capturing content directly when the whole server has exactly one pane.
-    Returns (text, buttons) -- buttons is None when text is the final
-    captured content rather than a menu prompt."""
-    sessions = list_tmux_sessions()
-    if not sessions:
-        return "tmux is unavailable: no sessions.", None
-    if len(sessions) == 1:
-        return screen_windows_entry(sessions[0])
-    return "Pick a tmux session:", [(name, f"/screen_windows {name}") for name in sessions]
-
-
-def screen_windows_entry(session):
-    windows = list_tmux_windows(session)
-    if not windows:
-        return f"No windows in session {session}.", None
-    if len(windows) == 1:
-        return screen_panes_entry(windows[0][0])
-    return f"Pick a window in {session}:", [(f"{session} — {name}", f"/screen_panes {target}") for target, name in windows]
-
-
-def screen_panes_entry(window_target):
-    panes = list_tmux_panes(window_target)
-    if not panes:
-        return f"No panes in {window_target}.", None
-    if len(panes) == 1:
-        return screen(target=panes[0][0]), None
-    buttons = [(f"{target} — {title}" if title and title != target else target, f"/screen_show {target}") for target, title in panes]
-    return f"Pick a pane in {window_target}:", buttons
+    """(text, buttons) listing every pane across the whole tmux server as a
+    button -- always, even if there's only one -- so tapping a screen is
+    always exactly one tap away from its content, with no auto-skipped
+    levels to cause surprises. callback_data is "/screen_show <target>"."""
+    buttons = []
+    for session in list_tmux_sessions():
+        for window_target, _ in list_tmux_windows(session):
+            for pane_target, pane_title in list_tmux_panes(window_target):
+                label = f"{pane_target} — {pane_title}" if pane_title and pane_title != pane_target else pane_target
+                buttons.append((label[:60], f"/screen_show {pane_target}"))
+    if not buttons:
+        return "tmux is unavailable: no panes found.", None
+    return "Pick a screen:", buttons
 
 
 def restart_controller():
@@ -976,7 +958,7 @@ def handle(message, state):
             "duration/prompt/last message (survives a restart). /tasks <job_id>: same detail directly. "
             "/cancel <job_id>: kill a running one. "
             "/restart: restart the controller's systemd service. "
-            "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
+            "/screen: every tmux pane on the server as a button, tap to see its content. "
             "/model: show/pick the Claude model for this conversation (sonnet/opus/haiku or any model id); "
             "/model default resets it. "
             "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
@@ -998,12 +980,6 @@ def handle(message, state):
         reply(chat_id, usage_report(), thread_id)
     elif command == "/screen":
         text, buttons = screen_entry()
-        reply(chat_id, text, thread_id, buttons=buttons)
-    elif command.startswith("/screen_windows "):
-        text, buttons = screen_windows_entry(command[16:].strip())
-        reply(chat_id, text, thread_id, buttons=buttons)
-    elif command.startswith("/screen_panes "):
-        text, buttons = screen_panes_entry(command[14:].strip())
         reply(chat_id, text, thread_id, buttons=buttons)
     elif command.startswith("/screen_show "):
         reply(chat_id, screen(target=command[13:].strip()), thread_id)
@@ -1098,7 +1074,7 @@ def handle_callback(callback_query, state):
     """An inline-button tap: acknowledge it (required so Telegram stops
     showing a loading spinner on the button), then replay its callback_data
     through the same handle() dispatcher a typed command would use -- e.g. a
-    /screen picker button's callback_data is literally "/screen_panes ..."."""
+    /screen picker button's callback_data is literally "/screen_show ..."."""
     try:
         api("answerCallbackQuery", {"callback_query_id": callback_query["id"]})
     except Exception as error:

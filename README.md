@@ -28,7 +28,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and last message/error — what tapping a `/tasks` button does. |
 | `/cancel <job_id>` | Kills a running background job. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
-| `/screen` | Picks a tmux session/window/pane via inline buttons across the whole tmux server, skipping straight to content wherever there's only one choice. |
+| `/screen` | One message listing every pane across the whole tmux server as a button (even if there's only one) — tap to capture and return its content. |
 | `/screen_show <target>` | Captures and returns a specific tmux target directly (e.g. `web:1`, `web:1.0`) — what the `/screen` buttons call under the hood. |
 | `/status` | Reports whether the tmux session exists. |
 | `/interrupt` | Sends Ctrl-C to the tmux session. |
@@ -111,15 +111,14 @@ with a fresh `/ask` or `/task` on the same topic — only that specific job's
 progress tracking ends at the interruption.
 
 `/screen` walks the *entire* tmux server, not just `TELEGRAM_CLAUDE_SESSION`
-— multiple sessions get a button per session, tapping one shows its windows,
-tapping a window shows its panes, and tapping a pane captures it. Each level
-is skipped automatically when there's only one choice, so a single-session,
-single-window, single-pane setup (the common case) still returns content
-immediately on a bare `/screen`, same as before. Button taps are Telegram
-`callback_query` updates: the bot acknowledges them (so the client stops
-showing a spinner) and replays the button's payload through the same command
-dispatcher a typed message would use — a `/screen` button is, under the
-hood, just `/screen_show <target>` sent on your behalf.
+— every pane in every window of every session gets its own button, always,
+even when there's only one pane total: tapping a screen is always exactly
+one tap away from its content, with no auto-skipped levels to cause
+surprises. Button taps are Telegram `callback_query` updates: the bot
+acknowledges them (so the client stops showing a spinner) and replays the
+button's payload through the same command dispatcher a typed message would
+use — a `/screen` button is, under the hood, just `/screen_show <target>`
+sent on your behalf.
 
 ## Requirements
 
