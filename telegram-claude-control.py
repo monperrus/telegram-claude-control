@@ -32,9 +32,9 @@ CLAUDE_BIN = os.environ.get("TELEGRAM_CLAUDE_BIN", os.path.expanduser("~/.local/
 PERMISSION_MODE = os.environ.get("TELEGRAM_CLAUDE_PERMISSION_MODE", "")
 ASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_ASK_TIMEOUT", "600"))
 SH_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_SH_TIMEOUT", "60"))
-# /bg jobs run detached from the ASK_TIMEOUT-bound foreground path (see
+# /task jobs run detached from the ASK_TIMEOUT-bound foreground path (see
 # ClaudeHeadless.start_background), so they get their own, much longer cap.
-BG_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_BG_TIMEOUT", "14400"))
+TASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_TASK_TIMEOUT", "14400"))
 # Inline the diff in the edited-file notification when total changed lines
 # (added + removed) is below this. Above it, only the +/- counts are shown.
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
@@ -59,7 +59,7 @@ BOT_COMMANDS = [
     ("newsession", "Forget this conversation and start fresh"),
     ("model", "Show/pick the Claude model for this conversation"),
     ("usage", "Current session/weekly usage against your plan limits"),
-    ("bg", "Run claude -p in the background, no timeout"),
+    ("task", "Run claude -p in the background, no timeout"),
     ("jobs", "List recent background jobs"),
     ("cancel", "Cancel a running background job"),
     ("sh", "Run a shell command directly"),
@@ -163,8 +163,8 @@ class ClaudeHeadless:
     Locking is per conversation_id, not global: a claude -p session cannot
     safely be driven by two concurrent processes sharing the same --resume
     id, but unrelated Telegram topics must still be able to run at the same
-    time -- otherwise one /bg job would freeze every other topic for as long
-    as it runs."""
+    time -- otherwise one /task job would freeze every other topic for as
+    long as it runs."""
 
     def __init__(self, sessions=None, models=None, on_change=None):
         self.sessions = sessions if sessions is not None else {}
@@ -196,7 +196,7 @@ class ClaudeHeadless:
         """One `claude -p` turn: spawns the process, parses its JSONL event
         stream (calling notify(text) per completed file-editing tool call),
         and returns the final assistant result text. Shared by the
-        foreground /ask path and background /bg jobs -- they differ only in
+        foreground /ask path and background /task jobs -- they differ only in
         their timeout and in how the caller is allowed to observe/cancel the
         process (on_process)."""
         args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
@@ -282,7 +282,7 @@ class ClaudeHeadless:
         """Runs one foreground turn, calling notify(text) for each completed
         file-editing tool call as it happens, and returning the final
         assistant result text once the turn completes. Raises immediately
-        (no blocking) if a /bg job already owns this conversation."""
+        (no blocking) if a /task job already owns this conversation."""
         notify = notify or (lambda text: None)
         lock = self._conversation_lock(conversation_id)
         if not lock.acquire(blocking=False):
@@ -304,7 +304,7 @@ class ClaudeHeadless:
         first); on_done(job_id, status, text) fires exactly once, with
         status one of "completed"/"failed"/"cancelled". Returns the new
         job_id, or None if this conversation is already busy (foreground or
-        another /bg job)."""
+        another /task job)."""
         on_start = on_start or (lambda job_id: None)
         on_done = on_done or (lambda job_id, status, text: None)
         lock = self._conversation_lock(conversation_id)
@@ -323,7 +323,7 @@ class ClaudeHeadless:
             # on_start (JOBS.start) can still fail for other reasons (e.g. a
             # locked db file). Without this, the lock/registry entry above
             # would leak permanently -- silently blocking every future /ask
-            # and /bg on this conversation with "already running" even
+            # and /task on this conversation with "already running" even
             # though no job is actually running.
             with self._jobs_lock:
                 self.jobs.pop(job_id, None)
@@ -337,7 +337,7 @@ class ClaudeHeadless:
 
         def worker():
             try:
-                result = self._execute(prompt, conversation_id, notify, BG_TIMEOUT, on_process=on_process)
+                result = self._execute(prompt, conversation_id, notify, TASK_TIMEOUT, on_process=on_process)
                 notify(f"✅ Background job {job_id} finished:\n{result}")
                 on_done(job_id, "completed", result)
             except Exception as error:
@@ -378,13 +378,13 @@ CLAUDE = ClaudeHeadless()
 
 
 class JobStore:
-    """Durable log of /bg jobs (SQLite) so /jobs history and status survive
+    """Durable log of /task jobs (SQLite) so /jobs history and status survive
     a controller restart -- unlike ClaudeHeadless's in-memory registry,
     which only knows about jobs from the current process's lifetime. This is
     a log, not a resumable queue: the underlying claude -p subprocess itself
     cannot survive a restart, so any row still marked "running" at startup
     is flagged "interrupted" (the conversation itself can still be continued
-    normally via --resume with a fresh /ask or /bg -- only that specific
+    normally via --resume with a fresh /ask or /task -- only that specific
     job's progress tracking was lost)."""
 
     def __init__(self, path):
@@ -408,7 +408,7 @@ class JobStore:
 
     def _connect(self):
         # One connection per thread: sqlite3 connections aren't safe to share
-        # across threads, and start_bg/worker/handle() calls all come from
+        # across threads, and start_task/worker/handle() calls all come from
         # different ones.
         if not hasattr(self._local, "db"):
             self._local.db = sqlite3.connect(self.path, timeout=30)
@@ -710,8 +710,8 @@ def run_ask(chat_id, thread_id, prompt):
             reply(chat_id, _friendly_claude_error(error), thread_id)
 
 
-def start_bg(chat_id, message_id, thread_id, prompt):
-    """Start a /bg job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
+def start_task(chat_id, message_id, thread_id, prompt):
+    """Start a /task job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
     job can run for hours. notify (here, reply) delivers both progress and
     the final completion/failure message whenever the job actually ends.
     on_start/on_done record the job in JOBS (SQLite) so /jobs history and
@@ -913,7 +913,7 @@ ONE_LETTER_SHORTCUTS = {
 }
 # One letter plus " <argument>".
 PREFIXED_SHORTCUTS = {
-    "t": "/bg",
+    "t": "/task",
     "m": "/tmux",
     "x": "/sh",
     "c": "/ask",
@@ -964,7 +964,7 @@ def handle(message, state):
             "/newsession: forget the headless conversation and start fresh. "
             "/tmux <text>: terminal input into the interactive session, then last 30 lines after 20 seconds. "
             "/sh <command>: run a shell command directly and return its output. "
-            "/bg <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
+            "/task <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
             "/jobs: list recent background jobs (survives a restart). /jobs <job_id>: detail. "
             "/cancel <job_id>: kill a running one. "
@@ -974,7 +974,7 @@ def handle(message, state):
             "/model default resets it. "
             "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
             "/status, /interrupt. "
-            "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/bg) "
+            "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=jobs (`t <prompt>`=/task) "
             "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask. "
             "Tap a button below for the commands that need no arguments, or type / for Telegram's own "
             "command menu (with the rest, autocompleted so you can just add the argument).",
@@ -1027,14 +1027,14 @@ def handle(message, state):
             start_sh(chat_id, message["message_id"], thread_id, shell_command)
         else:
             reply(chat_id, "Usage: /sh <command>", thread_id)
-    elif command == "/bg":
-        reply(chat_id, "Usage: /bg <prompt>", thread_id)
-    elif command.startswith("/bg "):
-        bg_prompt = command[4:].strip()
-        if bg_prompt:
-            start_bg(chat_id, message["message_id"], thread_id, bg_prompt)
+    elif command == "/task":
+        reply(chat_id, "Usage: /task <prompt>", thread_id)
+    elif command.startswith("/task "):
+        task_prompt = command[6:].strip()
+        if task_prompt:
+            start_task(chat_id, message["message_id"], thread_id, task_prompt)
         else:
-            reply(chat_id, "Usage: /bg <prompt>", thread_id)
+            reply(chat_id, "Usage: /task <prompt>", thread_id)
     elif command == "/jobs":
         reply(chat_id, jobs_summary(), thread_id)
     elif command.startswith("/jobs "):

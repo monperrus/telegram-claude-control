@@ -23,7 +23,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
-| `/bg <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
+| `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
 | `/jobs` | Lists the 8 most recent background jobs (icon, id, status, duration, prompt) — history survives a controller restart. |
 | `/jobs <job_id>` | Detail view: status, duration, thread, full prompt, and result/error. |
 | `/cancel <job_id>` | Kills a running background job. |
@@ -62,10 +62,10 @@ every command that needs no argument (`usage`, `status`, `screen`, `jobs`,
 the full command list with Telegram (`setMyCommands`) at startup, so typing
 `/` in any client brings up the native autocomplete menu with descriptions
 — tap one to insert `/command ` and just type the argument for commands
-like `/ask`, `/bg`, `/sh`, `/tmux`, `/cancel`, `/model <name>`.
+like `/ask`, `/task`, `/sh`, `/tmux`, `/cancel`, `/model <name>`.
 
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
-`v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/bg`
+`v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/jobs` (bare) or `/task`
 (`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`) `u`=`/usage`
 `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=`/ask <prompt>`.
 Only an exact `<letter>` or `<letter> <rest>` triggers a shortcut —
@@ -74,7 +74,7 @@ letters, e.g. "im on my way") falls through to the normal `/ask` prompt path
 unchanged. The one exception is `x`/`m`/`t`/`c`/`a`: a message that
 genuinely starts with one of those letters followed by a space (e.g. "x-ray"
 typed as "x ray gun") will be misread as a shortcut — say it another way, or
-use the full `/sh`/`/tmux`/`/bg`/`/ask`/`/model` command instead.
+use the full `/sh`/`/tmux`/`/task`/`/ask`/`/model` command instead.
 
 `/usage` runs Claude Code's own built-in `/usage` command (aliased
 `/cost`/`/stats`) directly via `claude -p "/usage" --output-format json` —
@@ -94,20 +94,20 @@ topic (`message_thread_id`) gets its own independent `claude -p` session and
 replies land back in that same topic, so parallel topics never share or
 clobber each other's Claude conversation.
 
-Only one request (foreground `/ask` or background `/bg`) runs per topic at a
+Only one request (foreground `/ask` or background `/task`) runs per topic at a
 time, since two processes can't safely share the same `--resume` session —
 a second request on the same topic is rejected with a "already running"
 reply rather than queued. Different topics run fully in parallel, so a
-long `/bg` job in one topic never blocks `/ask` in another.
+long `/task` job in one topic never blocks `/ask` in another.
 
-Every `/bg` job is logged to a small SQLite database
+Every `/task` job is logged to a small SQLite database
 (`TELEGRAM_CLAUDE_JOBS_DB`) as it starts and finishes, so `/jobs` history
 survives a controller restart even though the underlying `claude -p`
 subprocess itself can't: a job still marked "running" when the controller
 starts up is a leftover from a previous process and gets flagged
 "interrupted" rather than left looking falsely active. The conversation
 itself isn't lost either way — it's still resumable normally via `--resume`
-with a fresh `/ask` or `/bg` on the same topic — only that specific job's
+with a fresh `/ask` or `/task` on the same topic — only that specific job's
 progress tracking ends at the interruption.
 
 `/screen` walks the *entire* tmux server, not just `TELEGRAM_CLAUDE_SESSION`
@@ -215,14 +215,14 @@ Optional environment variables:
 | --- | --- | --- |
 | `TELEGRAM_CLAUDE_CONFIG` | `~/.config/telegram-claude-control.env` | Secret config file. |
 | `TELEGRAM_CLAUDE_STATE` | `~/.local/state/telegram-claude-control.json` | Pairing state and Telegram update offset. |
-| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/bg` jobs, for `/jobs` history across restarts. |
+| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/task` jobs, for `/jobs` history across restarts. |
 | `TELEGRAM_CLAUDE_SESSION` | `claude` | tmux target session for the `/tmux` bridge. |
 | `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Working directory for headless `claude -p` calls. |
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
 | `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. |
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
 | `TELEGRAM_CLAUDE_SH_TIMEOUT` | `60` | Seconds to wait for a `/sh` command before giving up. |
-| `TELEGRAM_CLAUDE_BG_TIMEOUT` | `14400` | Seconds to wait for a `/bg` background job before giving up (4 hours). |
+| `TELEGRAM_CLAUDE_TASK_TIMEOUT` | `14400` | Seconds to wait for a `/task` background job before giving up (4 hours). |
 | `TELEGRAM_CLAUDE_USAGE_TIMEOUT` | `30` | Seconds to wait for `/usage` before giving up. |
 | `TELEGRAM_CLAUDE_UNIT` | `telegram-claude-controller.service` | systemd `--user` unit name that `/restart` restarts. |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
