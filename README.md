@@ -24,8 +24,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
 | `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
-| `/tasks` | Lists the 8 most recent background jobs (icon, id, status, duration, prompt) — history survives a controller restart. |
-| `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and result/error. |
+| `/tasks` | One message listing the 5 most recent background jobs (icon, id, status, duration, prompt), each also a tappable button into its detail view — history survives a controller restart. |
+| `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and last message/error — what tapping a `/tasks` button does. |
 | `/cancel <job_id>` | Kills a running background job. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
 | `/screen` | Picks a tmux session/window/pane via inline buttons across the whole tmux server, skipping straight to content wherever there's only one choice. |

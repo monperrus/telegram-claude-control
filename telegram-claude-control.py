@@ -752,16 +752,22 @@ def human_duration(seconds):
 
 
 def tasks_summary():
-    rows = JOBS.recent()
+    """(text, buttons) for the 5 most recent /task jobs -- text shows all 5
+    at a glance, and each also gets a button (callback_data "/tasks
+    <job_id>") that drills into job_detail()'s duration/prompt/result view,
+    the same as tapping through /screen's picker."""
+    rows = JOBS.recent(5)
     if not rows:
-        return "No background jobs yet."
+        return "No background jobs yet.", None
     now = time.time()
     lines = []
+    buttons = []
     for job_id, status, prompt, created_at, finished_at in rows:
         icon = STATUS_ICONS.get(status, "?")
         duration = human_duration((finished_at or now) - created_at)
         lines.append(f"{icon} {job_id} ({status}, {duration}): {prompt[:80]}")
-    return "\n".join(lines) + "\n\nDetail: /tasks <job_id>"
+        buttons.append((f"{icon} {job_id}", f"/tasks {job_id}"))
+    return "\n".join(lines), buttons
 
 
 def job_detail(job_id):
@@ -777,7 +783,7 @@ def job_detail(job_id):
         f"Prompt: {prompt[:800]}",
     ]
     if result:
-        lines.append(f"Result: {result[:1500]}")
+        lines.append(f"Last message: {result[:1500]}")
     return "\n".join(lines)
 
 
@@ -966,7 +972,8 @@ def handle(message, state):
             "/sh <command>: run a shell command directly and return its output. "
             "/task <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
             "you get a message here the moment it finishes (or fails). "
-            "/tasks: list recent background jobs (survives a restart). /tasks <job_id>: detail. "
+            "/tasks: the 5 most recent background jobs, each tappable for its "
+            "duration/prompt/last message (survives a restart). /tasks <job_id>: same detail directly. "
             "/cancel <job_id>: kill a running one. "
             "/restart: restart the controller's systemd service. "
             "/screen: pick a tmux session/window/pane via buttons (skips straight to content if there's only one). "
@@ -1036,7 +1043,8 @@ def handle(message, state):
         else:
             reply(chat_id, "Usage: /task <prompt>", thread_id)
     elif command == "/tasks":
-        reply(chat_id, tasks_summary(), thread_id)
+        text, buttons = tasks_summary()
+        reply(chat_id, text, thread_id, buttons=buttons)
     elif command.startswith("/tasks "):
         reply(chat_id, job_detail(command[7:].strip()), thread_id)
     elif command == "/cancel":
